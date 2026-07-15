@@ -318,7 +318,7 @@ async def _stream_chat(message: str, session: str):
         return
 
     RUNNING[session] = proc
-    stopped = False
+    detached = False
     assert proc.stdout is not None
     try:
         while True:
@@ -327,19 +327,67 @@ async def _stream_chat(message: str, session: str):
                 break
             line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
             yield sse("chunk", {"text": line})
-    except asyncio.CancelledError:  # client disconnected / aborted the fetch
-        stopped = True
-        proc.kill()
-        await _kill_container_chat(session)
+    except asyncio.CancelledError:
+        # The client dropped — e.g. the phone locked and the browser suspended
+        # the tab. Do NOT kill the turn: let it finish server-side so Hermes
+        # saves the full response, and the user can resume the same session
+        # when they come back. Deliberate stops go through /api/stop, which
+        # kills on demand.
+        detached = True
+        asyncio.create_task(_finish_detached(proc, session))
         raise
+    finally:
+        if not detached:
+            if RUNNING.get(session) is proc:
+                del RUNNING[session]
+            try:
+                rc = await proc.wait()
+            except Exception:  # noqa: BLE001
+                rc = -1
+            # Hand back the native session id. A conversation started under a
+            # webui_* resume-name lives in a session whose *native* id is what
+            # `sessions export` needs — the client adopts it so reloads (after
+            # a phone lock, say) can restore this exact transcript.
+            nid = await _latest_cli_session_id()
+            yield sse("done", {"code": rc, "stopped": False, "session_id": nid})
+
+
+async def _finish_detached(proc, session: str) -> None:
+    """Drain a chat process to completion after the client left, then reap it.
+
+    Keeps reading stdout so the pipe never fills and blocks hermes mid-turn,
+    letting the response complete and persist to the session store.
+    """
+    try:
+        if proc.stdout is not None:
+            while await proc.stdout.readline():
+                pass
+        await proc.wait()
+    except Exception:  # noqa: BLE001
+        pass
     finally:
         if RUNNING.get(session) is proc:
             del RUNNING[session]
-        try:
-            rc = await proc.wait()
-        except Exception:  # noqa: BLE001
-            rc = -1
-        yield sse("done", {"code": rc, "stopped": stopped})
+
+
+async def _latest_cli_session_id() -> str:
+    """Native id of the most-recently-active CLI session (i.e. the one we just
+    drove). Used to translate a webui_* resume-name into an exportable id."""
+    try:
+        code, out = await _run(
+            *_exec_prefix(), "hermes", "sessions", "list",
+            "--source", "cli", "--limit", "1",
+        )
+        m = SESSION_ID_RE.search(out)
+        return m.group(0) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@app.get("/api/latest-session")
+async def latest_session():
+    """Newest CLI session id — lets the UI recover the native id after a drop."""
+    return {"id": await _latest_cli_session_id()}
 
 
 @app.post("/api/chat")
