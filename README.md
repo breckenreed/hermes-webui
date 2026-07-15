@@ -64,6 +64,23 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_CONTAINER` | `hermes-agent` | Name of the running Hermes container to drive |
 | `LLM_CLIENT_UID` | *(from `.env`)* | Passed through to `hermes` so the agent can reach its LLM endpoint |
 | `HERMES_MODEL` | *(empty)* | Optional model override (e.g. `google/gemma-4-12b`); blank uses the Hermes default |
+| `HERMES_SYSTEM_PREAMBLE` | *(built-in default)* | Short context note prepended to every prompt so small local models use their tools instead of guessing their environment. Set to an empty string to disable |
+
+### System preamble
+
+Small local models (e.g. `google/gemma-4-12b`) will sometimes answer filesystem
+questions from a hallucinated self-image ("I'm a WSL instance, files are under
+`/mnt/c`…") instead of actually running a tool. To counter this, the webui
+prepends a short context note to every prompt:
+
+> You are running inside a Linux container (not WSL). The user's Obsidian vault
+> is bind-mounted read-write at `/host/opser-local`. Always use your tools to
+> inspect or modify the filesystem — never guess about your environment or where
+> files live.
+
+The note is wrapped in internal markers and **stripped from the chat transcript**,
+so you only ever see your own messages. Override it with `HERMES_SYSTEM_PREAMBLE`
+(e.g. to point at a different vault path), or set it empty to turn it off.
 
 Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
 

@@ -14,6 +14,10 @@ services:
       - LLM_CLIENT_UID=${LLM_CLIENT_UID}
       # Optional: pin a model, e.g. google/gemma-4-12b (blank = use Hermes default)
       - HERMES_MODEL=
+      # Context note prepended to every prompt so small local models use their
+      # tools instead of hallucinating their environment. Set empty to disable.
+      # Leave unset to use the built-in default (mentions /host/opser-local).
+      # - HERMES_SYSTEM_PREAMBLE=You are in a Linux container; the vault is at /host/opser-local (rw). Always use your tools; never guess.
     env_file:
       - ./.env
     volumes:
