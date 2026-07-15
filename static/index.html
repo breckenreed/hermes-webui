@@ -154,13 +154,36 @@
 <script>
 const $ = s => document.querySelector(s);
 const messagesEl = $("#messages"), chatEl = $("#chat");
-let session = newSessionKey();
+const SESSION_LS = "hermes_webui_session";
+// Restore the last conversation so a page reload (mobile browsers reload the
+// tab when the phone locks) keeps the same session instead of starting fresh.
+let session = localStorage.getItem(SESSION_LS) || newSessionKey();
 let busy = false;
+let needsReload = false;   // set after a dropped connection; reload on return
 
 function newSessionKey(){
   const d = new Date();
   const p = n => String(n).padStart(2,"0");
   return `webui_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function setSession(s){
+  session = s;
+  try{ localStorage.setItem(SESSION_LS, s); }catch(e){ /* private mode */ }
+  $("#cursession").textContent = s;
+}
+
+// Fetch + render a session transcript. Returns the message count.
+async function loadTranscript(id){
+  const r = await fetch(`/api/session/${encodeURIComponent(id)}`);
+  const j = await r.json();
+  const msgs = j.messages || [];
+  if(msgs.length){
+    messagesEl.innerHTML = "";
+    msgs.forEach(m=> renderMessage(m.role, m.text, m.tools));
+    scroll();
+  }
+  return msgs.length;
 }
 
 /* ---------- tiny, safe markdown renderer ---------- */
@@ -315,17 +338,12 @@ function renderMessage(role, text, tools){
 async function openSession(id){
   if(busy) return;
   toggleSidebar(false);
-  session=id; $("#cursession").textContent=id;
+  setSession(id);
   document.querySelectorAll(".ses").forEach(e=>e.classList.remove("active"));
   messagesEl.innerHTML=`<div class="empty"><div class="big">⬡</div>loading session…</div>`;
   try{
-    const r=await fetch(`/api/session/${encodeURIComponent(id)}`);
-    const j=await r.json();
-    const msgs=j.messages||[];
-    if(!msgs.length){ showEmpty(); return; }
-    messagesEl.innerHTML="";
-    msgs.forEach(m=> renderMessage(m.role, m.text, m.tools));
-    scroll();
+    const n=await loadTranscript(id);
+    if(!n) showEmpty();
   }catch(e){
     messagesEl.innerHTML=`<div class="empty">failed to load session</div>`;
   }
@@ -373,6 +391,7 @@ async function send(){
   aBody.innerHTML=`<span class="cursor"></span>`;
 
   let finalText="";           // accumulated non-tool output
+  let adoptId=null;           // native session id reported by the backend
   const toolLines=[];
   function repaint(){
     let html="";
@@ -398,6 +417,8 @@ async function send(){
           if(isToolLine(line)) toolLines.push(line);
           else finalText += (finalText?"\n":"") + line;
           repaint();
+        } else if(ev.event==="done"){
+          if(ev.data && ev.data.session_id) adoptId=ev.data.session_id;
         } else if(ev.event==="error"){
           finalText += `\n\n_error: ${ev.data.message}_`; repaint();
         }
@@ -405,10 +426,18 @@ async function send(){
     }
   }catch(e){
     if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
-    else { finalText += `\n\n_connection error: ${e}_`; }
+    else {
+      // Stream dropped (e.g. the phone locked). The turn keeps running on the
+      // server and Hermes will save it — flag a reload for when we're back.
+      needsReload = true;
+      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — the reply is still being saved; it will reappear when you return_`;
+    }
   }finally{
     currentAbort=null;
     setBusy(false); repaint(); input.focus();
+    // Adopt the native session id so future reloads can restore this exact
+    // transcript (export needs the native id, not our webui_* resume-name).
+    if(adoptId && session.startsWith("webui_")) setSession(adoptId);
     loadSessions();
   }
 }
@@ -443,12 +472,37 @@ input.addEventListener("input",()=>{ input.style.height="auto"; input.style.heig
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
 });
-$("#newchat").onclick=()=>{ toggleSidebar(false); session=newSessionKey(); $("#cursession").textContent=session; showEmpty(); loadSessions(); input.focus(); };
+$("#newchat").onclick=()=>{ toggleSidebar(false); setSession(newSessionKey()); showEmpty(); loadSessions(); input.focus(); };
 
-$("#cursession").textContent=session;
-showEmpty(); health(); loadSessions();
+// When the tab comes back (phone unlocked, app refocused) after a dropped
+// stream, reload the session so a server-completed response shows up.
+async function reloadIfNeeded(){
+  if(needsReload && !busy){
+    needsReload=false;
+    try{
+      // If we dropped before the backend told us the native id, recover it
+      // (the turn we started is the most-recent session) so export can load it.
+      if(session.startsWith("webui_")){
+        const r=await fetch("/api/latest-session"); const j=await r.json();
+        if(j.id) setSession(j.id);
+      }
+      const n=await loadTranscript(session); if(!n) showEmpty();
+    }catch(e){ /* still offline */ }
+    loadSessions();
+  }
+}
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) reloadIfNeeded(); });
+window.addEventListener("focus", reloadIfNeeded);
+window.addEventListener("pageshow", reloadIfNeeded);
+
+// Startup: restore the persisted session and its transcript (if any).
+(async function boot(){
+  setSession(session);
+  health(); loadSessions();
+  try{ const n=await loadTranscript(session); if(!n) showEmpty(); }catch(e){ showEmpty(); }
+  input.focus();
+})();
 setInterval(health,15000);
-input.focus();
 </script>
 </body>
 </html>

@@ -100,6 +100,7 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `GET`  | `/api/health` | Is the Hermes container reachable? |
 | `GET`  | `/api/sessions` | List recent CLI sessions |
 | `GET`  | `/api/session/{id}` | Normalized transcript for one session |
+| `GET`  | `/api/latest-session` | Native id of the most-recent CLI session (used to recover after a dropped connection) |
 | `POST` | `/api/chat` | Send a prompt; streams the reply as SSE. Body: `{"message","session"}` |
 | `POST` | `/api/stop` | Stop the in-flight response for a session (kills the running hermes turn). Body: `{"session"}` |
 | `DELETE` | `/api/session/{id}` | Delete a session |
