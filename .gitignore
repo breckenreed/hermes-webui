@@ -1,0 +1,15 @@
+# Secrets — never commit real credentials
+.env
+.env.local
+*.env.bak*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
