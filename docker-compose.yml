@@ -1,0 +1,22 @@
+services:
+  hermes-webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-webui
+    restart: unless-stopped
+    ports:
+      - "8090:8000"
+    environment:
+      # Name of the running Hermes container to exec into
+      - HERMES_CONTAINER=hermes-agent
+      # Passed through to `hermes` so the agent can reach the LLM endpoint
+      - LLM_CLIENT_UID=${LLM_CLIENT_UID}
+      # Optional: pin a model, e.g. google/gemma-4-12b (blank = use Hermes default)
+      - HERMES_MODEL=
+    env_file:
+      - ./.env
+    volumes:
+      # Docker Desktop exposes the engine here; this lets the webui run
+      # `docker exec hermes-agent hermes ...`
+      - //var/run/docker.sock:/var/run/docker.sock
