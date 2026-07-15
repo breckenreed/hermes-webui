@@ -269,6 +269,28 @@ def _wrap_prompt(message: str) -> str:
     return f"{message}\n\n{PREAMBLE_OPEN}\n{SYSTEM_PREAMBLE}\n{PREAMBLE_CLOSE}"
 
 
+# In-flight chat processes, keyed by session, so the UI can stop them.
+RUNNING: dict[str, asyncio.subprocess.Process] = {}
+
+
+async def _kill_container_chat(session: str) -> None:
+    """Terminate the hermes turn for `session` running *inside* the container.
+
+    Killing the local `docker exec` client does not reliably stop the process
+    it spawned in the container, so we pkill it by its unique `--resume <key>`
+    command line. Session keys contain no regex metacharacters.
+    """
+    try:
+        p = await asyncio.create_subprocess_exec(
+            *_exec_prefix(), "pkill", "-TERM", "-f", "--", f"--resume {session}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await p.wait()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _stream_chat(message: str, session: str):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives."""
     args = _exec_prefix() + [
@@ -295,6 +317,8 @@ async def _stream_chat(message: str, session: str):
         yield sse("done", {})
         return
 
+    RUNNING[session] = proc
+    stopped = False
     assert proc.stdout is not None
     try:
         while True:
@@ -303,12 +327,19 @@ async def _stream_chat(message: str, session: str):
                 break
             line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
             yield sse("chunk", {"text": line})
-    except asyncio.CancelledError:  # client disconnected
+    except asyncio.CancelledError:  # client disconnected / aborted the fetch
+        stopped = True
         proc.kill()
+        await _kill_container_chat(session)
         raise
     finally:
-        rc = await proc.wait()
-        yield sse("done", {"code": rc})
+        if RUNNING.get(session) is proc:
+            del RUNNING[session]
+        try:
+            rc = await proc.wait()
+        except Exception:  # noqa: BLE001
+            rc = -1
+        yield sse("done", {"code": rc, "stopped": stopped})
 
 
 @app.post("/api/chat")
@@ -322,6 +353,28 @@ async def chat(body: ChatBody):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class StopBody(BaseModel):
+    session: str
+
+
+@app.post("/api/stop")
+async def stop(body: StopBody):
+    """Stop the in-flight response for a session (kills the running hermes turn)."""
+    session = body.session.strip()
+    if not session:
+        return JSONResponse({"error": "no session"}, status_code=400)
+    proc = RUNNING.get(session)
+    if proc is not None:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    # Always pkill inside the container too — the exec'd process can outlive
+    # its local client, and there may be no local handle after a reconnect.
+    await _kill_container_chat(session)
+    return {"ok": True, "had_local_process": proc is not None}
 
 
 if __name__ == "__main__":
