@@ -35,6 +35,27 @@ LLM_CLIENT_UID = os.environ.get("LLM_CLIENT_UID", "")
 DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "")  # optional override
 STATIC_DIR = Path(__file__).parent / "static"
 
+# A short context note prepended to every prompt. Small local models tend to
+# hallucinate their environment ("I'm a WSL instance…") and answer filesystem
+# questions without actually running a tool. This nudges them to act. Override
+# with HERMES_SYSTEM_PREAMBLE; set it to an empty string to disable entirely.
+_DEFAULT_PREAMBLE = (
+    "You are running inside a Linux container (not WSL). The user's Obsidian "
+    "vault is bind-mounted read-write at /host/opser-local. Always use your "
+    "tools to inspect or modify the filesystem — never guess about your "
+    "environment or where files live."
+)
+SYSTEM_PREAMBLE = os.environ.get("HERMES_SYSTEM_PREAMBLE", _DEFAULT_PREAMBLE).strip()
+
+# Markers wrap the preamble in the sent prompt so we can strip it back out when
+# rendering a stored transcript — the user only ever sees their own text.
+PREAMBLE_OPEN = "<<webui-context>>"
+PREAMBLE_CLOSE = "<</webui-context>>"
+PREAMBLE_BLOCK_RE = re.compile(
+    re.escape(PREAMBLE_OPEN) + r".*?" + re.escape(PREAMBLE_CLOSE) + r"\s*",
+    re.DOTALL,
+)
+
 app = FastAPI(title="Hermes WebUI")
 
 # Matches Hermes session IDs like 20260715_193102_62eba9
@@ -112,12 +133,22 @@ async def sessions(limit: int = 40):
             continue
         sid = m.group(0)
         left = line[: m.start()].rstrip()
-        # Columns are separated by runs of 2+ spaces: Title | Workspace | LastActive
+        # Columns separated by runs of 2+ spaces:
+        # Preview | Workspace | LastActive | Src
         cols = [c.strip() for c in re.split(r"\s{2,}", left) if c.strip()]
         title = cols[0] if cols else ""
+        # Strip any leftover webui context note from the preview text.
+        title = PREAMBLE_BLOCK_RE.sub("", title).strip()
+        if title.startswith(PREAMBLE_OPEN):  # truncated marker in the preview
+            title = ""
         if title in ("—", "-", ""):
             title = ""
-        last_active = cols[-1] if len(cols) >= 2 else ""
+        # Last-active is the column that looks like a time, e.g. "3m ago".
+        last_active = ""
+        for c in cols[1:]:
+            if c == "just now" or re.search(r"\b(ago|now)\b", c):
+                last_active = c
+                break
         items.append({"id": sid, "title": title, "last_active": last_active})
     return {"sessions": items}
 
@@ -168,7 +199,10 @@ async def session_transcript(sid: str):
             tools.append(f"{name} {str(args or '')[:160]}".strip())
 
         if role == "user" and content:
-            messages.append({"role": "user", "text": content, "tools": []})
+            # Hide the webui context preamble we prepend to prompts.
+            content = PREAMBLE_BLOCK_RE.sub("", content).strip()
+            if content:
+                messages.append({"role": "user", "text": content, "tools": []})
         elif role == "assistant":
             if content or tools:
                 messages.append({"role": "assistant", "text": content, "tools": tools})
@@ -223,10 +257,22 @@ async def rename_session(sid: str, body: RenameBody):
     return JSONResponse({"ok": code == 0, "message": out}, status_code=200 if code == 0 else 500)
 
 
+def _wrap_prompt(message: str) -> str:
+    """Append the (marker-wrapped) system preamble after the user's text.
+
+    Appending (rather than prepending) keeps the user's own words at the start
+    of the prompt, so Hermes derives a clean session title from them instead of
+    from our context note. The markers let us strip it back out of transcripts.
+    """
+    if not SYSTEM_PREAMBLE:
+        return message
+    return f"{message}\n\n{PREAMBLE_OPEN}\n{SYSTEM_PREAMBLE}\n{PREAMBLE_CLOSE}"
+
+
 async def _stream_chat(message: str, session: str):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives."""
     args = _exec_prefix() + [
-        "hermes", "-z", message,
+        "hermes", "-z", _wrap_prompt(message),
         "--resume", session,
         "--yolo", "--cli",
     ]
