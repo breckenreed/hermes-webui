@@ -81,9 +81,11 @@
   #input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:10px;color:var(--text);
     font-family:var(--sans);font-size:14px;padding:11px 14px;resize:none;max-height:200px;line-height:1.5;outline:none}
   #input:focus{border-color:var(--accent)}
-  #send{background:var(--accent);color:#111;border:none;border-radius:10px;width:44px;height:44px;cursor:pointer;font-size:18px;flex:0 0 44px}
+  #send{background:var(--accent);color:#111;border:none;border-radius:10px;width:44px;height:44px;cursor:pointer;font-size:18px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;line-height:1}
   #send:disabled{opacity:.4;cursor:not-allowed}
   #send:hover:not(:disabled){background:var(--accent2)}
+  #send.stopping{background:var(--red);color:#fff;font-size:15px}
+  #send.stopping:hover{background:#ff6b60}
   .hint{max-width:820px;margin:6px auto 0;padding:0 20px;color:var(--muted);font-size:11px;font-family:var(--mono)}
   ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:#2a3038;border-radius:5px}
 </style>
@@ -304,11 +306,30 @@ async function health(){
   }catch(e){ $("#statustext").textContent="backend offline"; }
 }
 
-/* ---------- send ---------- */
+/* ---------- send / stop ---------- */
+let currentAbort=null;
+
+function setBusy(b){
+  busy=b;
+  const btn=$("#send");
+  if(b){ btn.classList.add("stopping"); btn.textContent="■"; btn.title="Stop"; }
+  else { btn.classList.remove("stopping"); btn.textContent="➤"; btn.title="Send"; }
+}
+
+async function stopGeneration(){
+  // Ask the backend to kill the running hermes turn, then abort the stream.
+  try{
+    await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session})});
+  }catch(e){ /* ignore */ }
+  if(currentAbort) currentAbort.abort();
+}
+
 async function send(){
   const input=$("#input"); const text=input.value.trim();
   if(!text || busy) return;
-  busy=true; $("#send").disabled=true;
+  setBusy(true);
+  currentAbort=new AbortController();
   input.value=""; input.style.height="auto";
   $("#cursession").textContent=session;
 
@@ -327,7 +348,7 @@ async function send(){
 
   try{
     const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:text,session})});
+      body:JSON.stringify({message:text,session}), signal:currentAbort.signal});
     const reader=resp.body.getReader(); const dec=new TextDecoder();
     let buf="";
     while(true){
@@ -348,9 +369,11 @@ async function send(){
       }
     }
   }catch(e){
-    finalText += `\n\n_connection error: ${e}_`;
+    if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
+    else { finalText += `\n\n_connection error: ${e}_`; }
   }finally{
-    busy=false; $("#send").disabled=false; repaint(); input.focus();
+    currentAbort=null;
+    setBusy(false); repaint(); input.focus();
     loadSessions();
   }
 }
@@ -369,7 +392,7 @@ function parseSSE(raw){
 }
 
 /* ---------- wiring ---------- */
-$("#send").onclick=send;
+$("#send").onclick=()=>{ if(busy) stopGeneration(); else send(); };
 const input=$("#input");
 input.addEventListener("input",()=>{ input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,200)+"px"; });
 input.addEventListener("keydown",e=>{
