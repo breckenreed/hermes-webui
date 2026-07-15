@@ -10,6 +10,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🧵 **Session sidebar** — every Hermes CLI session is listed; click one to load its full transcript (user messages, tool calls, results, and answers).
 - 🔁 **Resume any conversation** — sending a message continues that exact session, so context is preserved by Hermes' own session store.
 - 🗂️ **Session actions** — per-session `⋯` menu to **Rename**, **Copy ID**, or **Delete**.
+- ⏹ **Stop** — interrupt a running response mid-stream; the Send button becomes a Stop button while the agent is working.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -83,6 +84,7 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `GET`  | `/api/sessions` | List recent CLI sessions |
 | `GET`  | `/api/session/{id}` | Normalized transcript for one session |
 | `POST` | `/api/chat` | Send a prompt; streams the reply as SSE. Body: `{"message","session"}` |
+| `POST` | `/api/stop` | Stop the in-flight response for a session (kills the running hermes turn). Body: `{"session"}` |
 | `DELETE` | `/api/session/{id}` | Delete a session |
 | `POST` | `/api/session/{id}/rename` | Rename a session. Body: `{"title"}` |
 
