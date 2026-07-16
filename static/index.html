@@ -137,7 +137,7 @@
   <section id="main">
     <div id="topbar">
       <button id="menubtn" aria-label="Toggle sessions">☰</button>
-      <span class="k">session</span><span class="v" id="cursession">—</span>
+      <span class="k">chat</span><span class="v" id="cursession">—</span>
       <span style="flex:1"></span>
       <span class="k">container</span><span class="v" id="containername">hermes-agent</span>
     </div>
@@ -154,36 +154,46 @@
 <script>
 const $ = s => document.querySelector(s);
 const messagesEl = $("#messages"), chatEl = $("#chat");
-const SESSION_LS = "hermes_webui_session";
-// Restore the last conversation so a page reload (mobile browsers reload the
-// tab when the phone locks) keeps the same session instead of starting fresh.
-let session = localStorage.getItem(SESSION_LS) || newSessionKey();
 let busy = false;
-let needsReload = false;   // set after a dropped connection; reload on return
+let needsReload = false;   // set after a dropped connection; recover on return
+let lastTurnKey = null;    // per-turn key of the most recent send (for recovery)
 
-function newSessionKey(){
-  const d = new Date();
-  const p = n => String(n).padStart(2,"0");
-  return `webui_${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+/* ---------- conversation store (owned by the webui, persisted locally) ----------
+   hermes -z is one-shot and does not carry context across turns, so the webui
+   keeps each conversation itself and injects the history into every prompt.
+   localStorage:  hermes_convos = [{id,title,updated}]  ·  hermes_msgs_<id> = [{role,text,tools}]
+*/
+const CONVOS_LS="hermes_convos", ACTIVE_LS="hermes_active";
+const msgsKey = id => "hermes_msgs_"+id;
+let convos = readJSON(CONVOS_LS, []);
+let activeId = localStorage.getItem(ACTIVE_LS) || null;
+let messages = [];          // messages of the active conversation
+
+function readJSON(k, d){ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }
+function writeJSON(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){ /* private mode / quota */ } }
+function newConvoId(){ return "c_"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
+function saveMessages(){ writeJSON(msgsKey(activeId), messages); }
+function convoTitle(id){ const c=convos.find(x=>x.id===id); return c ? c.title : null; }
+
+function touchConvo(id, title){
+  let c = convos.find(x=>x.id===id);
+  if(!c){ c={id, title: title||"New chat", updated: Date.now()}; }
+  else { if(title) c.title=title; c.updated=Date.now(); convos=convos.filter(x=>x.id!==id); }
+  convos.unshift(c);
+  writeJSON(CONVOS_LS, convos);
 }
+function timeago(ts){ if(!ts) return ""; const s=(Date.now()-ts)/1000;
+  if(s<60) return "just now"; if(s<3600) return Math.floor(s/60)+"m ago";
+  if(s<86400) return Math.floor(s/3600)+"h ago"; return Math.floor(s/86400)+"d ago"; }
 
-function setSession(s){
-  session = s;
-  try{ localStorage.setItem(SESSION_LS, s); }catch(e){ /* private mode */ }
-  $("#cursession").textContent = s;
-}
-
-// Fetch + render a session transcript. Returns the message count.
-async function loadTranscript(id){
-  const r = await fetch(`/api/session/${encodeURIComponent(id)}`);
-  const j = await r.json();
-  const msgs = j.messages || [];
-  if(msgs.length){
-    messagesEl.innerHTML = "";
-    msgs.forEach(m=> renderMessage(m.role, m.text, m.tools));
-    scroll();
-  }
-  return msgs.length;
+// Split a captured turn's raw output back into assistant text + tool lines.
+function parseTurn(raw){
+  let finalText=""; const toolLines=[];
+  (raw||"").split("\n").forEach(line=>{
+    if(isToolLine(line)) toolLines.push(line);
+    else finalText += (finalText?"\n":"") + line;
+  });
+  return {finalText, toolLines};
 }
 
 /* ---------- tiny, safe markdown renderer ---------- */
@@ -232,8 +242,13 @@ function renderInlineNoBlock(t){
 function clearEmpty(){ const e=$(".empty"); if(e) e.remove(); }
 function showEmpty(){
   messagesEl.innerHTML = `<div class="empty"><div class="big">⬡</div>
-    Local Hermes is ready.<br>Send a command to begin.<br><br>
-    <span style="font-size:12px">session <code>${session}</code></span></div>`;
+    Local Hermes is ready.<br>Send a command to begin.</div>`;
+}
+function renderConversation(){
+  if(!messages.length){ showEmpty(); return; }
+  messagesEl.innerHTML="";
+  messages.forEach(m=> renderMessage(m.role, m.text, m.tools));
+  scroll();
 }
 function addMsg(role){
   clearEmpty();
@@ -246,23 +261,17 @@ function addMsg(role){
 }
 function scroll(){ chatEl.scrollTop = chatEl.scrollHeight; }
 
-async function loadSessions(){
-  try{
-    const r = await fetch("/api/sessions"); const j = await r.json();
-    const box = $("#sessions"); box.innerHTML="";
-    (j.sessions||[]).forEach(s=>{
-      const el=document.createElement("div"); el.className="ses"+(s.id===session?" active":"");
-      el.innerHTML=`<div class="t">${esc(s.title||"(untitled)")}</div>`+
-        `<div class="m">${esc(s.last_active||"")} · ${s.id.slice(-6)}</div>`+
-        `<button class="dots" title="Actions">⋯</button>`;
-      el.onclick=()=>{ openSession(s.id); };
-      el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, s); };
-      box.append(el);
-    });
-  }catch(e){ /* ignore */ }
-}
-function highlight(){
-  document.querySelectorAll(".ses").forEach(e=>e.classList.remove("active"));
+function renderConvos(){
+  const box = $("#sessions"); box.innerHTML="";
+  convos.forEach(c=>{
+    const el=document.createElement("div"); el.className="ses"+(c.id===activeId?" active":"");
+    el.innerHTML=`<div class="t">${esc(c.title||"(untitled)")}</div>`+
+      `<div class="m">${esc(timeago(c.updated))}</div>`+
+      `<button class="dots" title="Actions">⋯</button>`;
+    el.onclick=()=>{ openConvo(c.id); };
+    el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, c); };
+    box.append(el);
+  });
 }
 
 /* ---------- session context menu ---------- */
@@ -286,9 +295,9 @@ function openMenu(anchor, s){
   m.addEventListener("click", e=>e.stopPropagation());
   m.querySelectorAll("button").forEach(b=>{
     b.onclick=()=>{ const a=b.dataset.a; closeMenu();
-      if(a==="rename") renameSession(s);
-      else if(a==="copy"){ navigator.clipboard.writeText(s.id).then(()=>toast("Session ID copied")); }
-      else if(a==="delete") deleteSession(s);
+      if(a==="rename") renameConvo(s);
+      else if(a==="copy"){ navigator.clipboard.writeText(s.id).then(()=>toast("Conversation ID copied")); }
+      else if(a==="delete") deleteConvo(s);
     };
   });
   openMenuEl=m;
@@ -299,31 +308,27 @@ function toast(msg){
   document.body.append(t); setTimeout(()=>t.remove(),2200);
 }
 
-async function deleteSession(s){
-  const label=s.title||s.id;
-  if(!confirm(`Delete session "${label}"?\nThis permanently removes it from Hermes.`)) return;
-  try{
-    const r=await fetch(`/api/session/${encodeURIComponent(s.id)}`,{method:"DELETE"});
-    const j=await r.json();
-    if(j.ok){
-      toast("Session deleted");
-      if(s.id===session){ session=newSessionKey(); $("#cursession").textContent=session; showEmpty(); }
-    } else { toast("Delete failed"); }
-  }catch(e){ toast("Delete failed"); }
-  loadSessions();
+function deleteConvo(c){
+  if(!confirm(`Delete conversation "${c.title||"(untitled)"}"?`)) return;
+  convos = convos.filter(x=>x.id!==c.id);
+  writeJSON(CONVOS_LS, convos);
+  try{ localStorage.removeItem(msgsKey(c.id)); }catch(e){}
+  if(c.id===activeId){
+    if(convos.length) openConvo(convos[0].id);
+    else newConvo();
+  }
+  renderConvos();
+  toast("Conversation deleted");
 }
 
-async function renameSession(s){
-  const title=prompt("New title for this session:", s.title||"");
+function renameConvo(c){
+  const title=prompt("Rename conversation:", c.title||"");
   if(title===null) return;
   const t=title.trim(); if(!t) return;
-  try{
-    const r=await fetch(`/api/session/${encodeURIComponent(s.id)}/rename`,{method:"POST",
-      headers:{"Content-Type":"application/json"}, body:JSON.stringify({title:t})});
-    const j=await r.json();
-    toast(j.ok?"Session renamed":"Rename failed");
-  }catch(e){ toast("Rename failed"); }
-  loadSessions();
+  touchConvo(c.id, t);
+  if(c.id===activeId) $("#cursession").textContent=t;
+  renderConvos();
+  toast("Renamed");
 }
 
 /* render a full transcript message (with optional tool lines) */
@@ -335,19 +340,25 @@ function renderMessage(role, text, tools){
   body.innerHTML=html;
 }
 
-async function openSession(id){
+function openConvo(id){
   if(busy) return;
   toggleSidebar(false);
-  setSession(id);
-  document.querySelectorAll(".ses").forEach(e=>e.classList.remove("active"));
-  messagesEl.innerHTML=`<div class="empty"><div class="big">⬡</div>loading session…</div>`;
-  try{
-    const n=await loadTranscript(id);
-    if(!n) showEmpty();
-  }catch(e){
-    messagesEl.innerHTML=`<div class="empty">failed to load session</div>`;
-  }
-  loadSessions();
+  activeId=id; try{ localStorage.setItem(ACTIVE_LS, id); }catch(e){}
+  messages = readJSON(msgsKey(id), []);
+  $("#cursession").textContent = convoTitle(id) || "chat";
+  renderConversation();
+  renderConvos();
+}
+
+function newConvo(){
+  toggleSidebar(false);
+  activeId = newConvoId();
+  try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){}
+  messages = [];
+  $("#cursession").textContent = "New chat";
+  showEmpty();
+  renderConvos();
+  $("#input").focus();
 }
 
 async function health(){
@@ -370,10 +381,10 @@ function setBusy(b){
 }
 
 async function stopGeneration(){
-  // Ask the backend to kill the running hermes turn, then abort the stream.
+  // Ask the backend to kill the running turn, then abort the stream.
   try{
-    await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({session})});
+    if(lastTurnKey) await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session:lastTurnKey})});
   }catch(e){ /* ignore */ }
   if(currentAbort) currentAbort.abort();
 }
@@ -381,17 +392,27 @@ async function stopGeneration(){
 async function send(){
   const input=$("#input"); const text=input.value.trim();
   if(!text || busy) return;
+  if(!activeId){ activeId=newConvoId(); try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){} messages=[]; }
   setBusy(true);
   currentAbort=new AbortController();
   input.value=""; input.style.height="auto";
-  $("#cursession").textContent=session;
 
+  // History = the conversation so far (role/text only); the backend injects it.
+  const history = messages.map(m=>({role:m.role, text:m.text}));
+
+  // Record + render the user turn; title the conversation from its first line.
+  const firstUser = !messages.some(m=>m.role==="user");
+  messages.push({role:"user", text, tools:[]});
   const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(text);
-  const aBody=addMsg("assistant");
-  aBody.innerHTML=`<span class="cursor"></span>`;
+  touchConvo(activeId, firstUser ? text.slice(0,60) : null);
+  $("#cursession").textContent = convoTitle(activeId) || "chat";
+  saveMessages(); renderConvos();
+
+  const aBody=addMsg("assistant"); aBody.innerHTML=`<span class="cursor"></span>`;
+  const turnKey = activeId+"__"+Date.now().toString(36);
+  lastTurnKey = turnKey;
 
   let finalText="";           // accumulated non-tool output
-  let adoptId=null;           // native session id reported by the backend
   const toolLines=[];
   function repaint(){
     let html="";
@@ -402,7 +423,7 @@ async function send(){
 
   try{
     const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:text,session}), signal:currentAbort.signal});
+      body:JSON.stringify({message:text, session:turnKey, history}), signal:currentAbort.signal});
     const reader=resp.body.getReader(); const dec=new TextDecoder();
     let buf="";
     while(true){
@@ -417,8 +438,6 @@ async function send(){
           if(isToolLine(line)) toolLines.push(line);
           else finalText += (finalText?"\n":"") + line;
           repaint();
-        } else if(ev.event==="done"){
-          if(ev.data && ev.data.session_id) adoptId=ev.data.session_id;
         } else if(ev.event==="error"){
           finalText += `\n\n_error: ${ev.data.message}_`; repaint();
         }
@@ -428,17 +447,16 @@ async function send(){
     if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
     else {
       // Stream dropped (e.g. the phone locked). The turn keeps running on the
-      // server and Hermes will save it — flag a reload for when we're back.
+      // server; its reply is buffered and recovered when we return.
       needsReload = true;
-      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — the reply is still being saved; it will reappear when you return_`;
+      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — the reply is still being written; it will reappear when you return_`;
     }
   }finally{
     currentAbort=null;
     setBusy(false); repaint(); input.focus();
-    // Adopt the native session id so future reloads can restore this exact
-    // transcript (export needs the native id, not our webui_* resume-name).
-    if(adoptId && session.startsWith("webui_")) setSession(adoptId);
-    loadSessions();
+    // Persist the assistant turn into the conversation history.
+    messages.push({role:"assistant", text:finalText, tools:toolLines});
+    touchConvo(activeId, null); saveMessages(); renderConvos();
   }
 }
 function isToolLine(l){
@@ -472,35 +490,40 @@ input.addEventListener("input",()=>{ input.style.height="auto"; input.style.heig
 input.addEventListener("keydown",e=>{
   if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
 });
-$("#newchat").onclick=()=>{ toggleSidebar(false); setSession(newSessionKey()); showEmpty(); loadSessions(); input.focus(); };
+$("#newchat").onclick=()=>{ newConvo(); };
 
-// When the tab comes back (phone unlocked, app refocused) after a dropped
-// stream, reload the session so a server-completed response shows up.
+// When the tab comes back (phone unlocked, refocused) after a dropped stream,
+// recover the reply that finished on the server and slot it into the history.
 async function reloadIfNeeded(){
-  if(needsReload && !busy){
-    needsReload=false;
-    try{
-      // If we dropped before the backend told us the native id, recover it
-      // (the turn we started is the most-recent session) so export can load it.
-      if(session.startsWith("webui_")){
-        const r=await fetch("/api/latest-session"); const j=await r.json();
-        if(j.id) setSession(j.id);
+  if(!(needsReload && !busy && lastTurnKey)) return;
+  try{
+    const r=await fetch("/api/turn/"+encodeURIComponent(lastTurnKey));
+    const j=await r.json();
+    if(j.done){                 // reply finished on the server
+      needsReload=false;
+      if(j.text){
+        const {finalText, toolLines}=parseTurn(j.text);
+        if(messages.length && messages[messages.length-1].role==="assistant"){
+          messages[messages.length-1]={role:"assistant", text:finalText, tools:toolLines};
+          saveMessages(); renderConversation();
+        }
       }
-      const n=await loadTranscript(session); if(!n) showEmpty();
-    }catch(e){ /* still offline */ }
-    loadSessions();
-  }
+    } // still running -> leave needsReload set, retry on next focus
+  }catch(e){ /* still offline */ }
 }
 document.addEventListener("visibilitychange",()=>{ if(!document.hidden) reloadIfNeeded(); });
 window.addEventListener("focus", reloadIfNeeded);
 window.addEventListener("pageshow", reloadIfNeeded);
 
-// Startup: restore the persisted session and its transcript (if any).
-(async function boot(){
-  setSession(session);
-  health(); loadSessions();
-  try{ const n=await loadTranscript(session); if(!n) showEmpty(); }catch(e){ showEmpty(); }
-  input.focus();
+// Startup: restore the active conversation (or the most recent) from storage.
+(function boot(){
+  if(!activeId || !convos.some(c=>c.id===activeId)){
+    activeId = convos.length ? convos[0].id : newConvoId();
+  }
+  try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){}
+  messages = readJSON(msgsKey(activeId), []);
+  $("#cursession").textContent = convoTitle(activeId) || "New chat";
+  renderConvos(); renderConversation(); health(); input.focus();
 })();
 setInterval(health,15000);
 </script>
