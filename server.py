@@ -316,12 +316,74 @@ async def _kill_container_chat(session: str) -> None:
         pass
 
 
+async def _run_out(*args: str, timeout: float = 30) -> str:
+    """Run a command and return stdout only (stderr discarded) — for JSON."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    return (out or b"").decode(errors="replace")
+
+
+async def _latest_cli_session_id() -> str:
+    """Native id of the most-recently-active CLI session in Hermes' store."""
+    try:
+        out = await _run_out(
+            *_exec_prefix(), "hermes", "sessions", "list",
+            "--source", "cli", "--limit", "1", timeout=20)
+        m = SESSION_ID_RE.search(ANSI_RE.sub("", out))
+        return m.group(0) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _export_turn_events(sid: str) -> list[dict]:
+    """Ordered tool activity of one Hermes session: calls and their results.
+
+    Used to mirror the agent's actions into the chat, Claude-code style. The
+    export is read-only, so polling it mid-turn is safe.
+    """
+    try:
+        out = await _run_out(
+            *_exec_prefix(), "hermes", "sessions", "export",
+            "--format", "jsonl", "--session-id", sid, "-", timeout=25)
+        out = out.strip()
+        obj = json.loads(out[out.index("{"):].splitlines()[0])
+    except Exception:  # noqa: BLE001
+        return []
+    events: list[dict] = []
+    for m in obj.get("messages", []):
+        role = m.get("role")
+        if role == "assistant":
+            for tc in (m.get("tool_calls") or []):
+                fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
+                args = fn.get("arguments")
+                if isinstance(args, (dict, list)):
+                    args = json.dumps(args, ensure_ascii=False)
+                events.append({"kind": "call",
+                               "name": fn.get("name") or "?",
+                               "args": str(args or "")[:300]})
+        elif role == "tool":
+            content = m.get("content")
+            if isinstance(content, list):
+                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+            events.append({"kind": "result",
+                           "text": (content or "").replace("\n", " ")[:300]})
+    return events
+
+
 async def _stream_chat(history: list[dict], message: str, session: str):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives.
 
     `session` is a unique per-turn key: it isolates this turn's Hermes session
     (a fresh name starts clean) and is the handle /api/stop uses to kill it.
     Context comes from the injected history, not from Hermes' session store.
+
+    While the turn runs, a poller watches the forked Hermes session and emits
+    `tool` events (calls + results) so the UI can show the agent's actions
+    live, Claude-code style.
     """
     args = _exec_prefix() + [
         "hermes", "-z", _compose_prompt(history, message),
@@ -336,6 +398,9 @@ async def _stream_chat(history: list[dict], message: str, session: str):
 
     yield sse("start", {"session": session})
 
+    # Snapshot the newest session id so the poller can spot this turn's fork.
+    pre_id = await _latest_cli_session_id()
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -348,57 +413,137 @@ async def _stream_chat(history: list[dict], message: str, session: str):
         return
 
     RUNNING[session] = proc
-    detached = False
     captured: list[str] = []
-    assert proc.stdout is not None
-    try:
-        while True:
-            raw = await proc.stdout.readline()
-            if not raw:
-                break
-            line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
-            captured.append(line)
-            yield sse("chunk", {"text": line})
-    except asyncio.CancelledError:
-        # The client dropped — e.g. the phone locked and the browser suspended
-        # the tab. Do NOT kill the turn: let it finish server-side and buffer
-        # the reply so the client can recover it on return. Deliberate stops go
-        # through /api/stop, which kills on demand.
-        detached = True
-        asyncio.create_task(_finish_detached(proc, session, captured))
-        raise
-    finally:
-        if not detached:
-            if RUNNING.get(session) is proc:
-                del RUNNING[session]
-            try:
-                rc = await proc.wait()
-            except Exception:  # noqa: BLE001
-                rc = -1
-            _buffer_reply(session, "\n".join(captured))
-            yield sse("done", {"code": rc, "stopped": False})
+    q: asyncio.Queue = asyncio.Queue()
+    trace = {"turn_id": "", "sent": 0}
 
-
-async def _finish_detached(proc, session: str, captured: list[str]) -> None:
-    """Drain a chat process to completion after the client left, then reap it.
-
-    Keeps reading stdout so the pipe never fills (which would block hermes
-    mid-turn) and buffers the full reply for recovery via /api/turn.
-    """
-    try:
-        if proc.stdout is not None:
+    async def read_stdout():
+        """Drain stdout to the queue; on EOF reap the process and buffer the
+        reply. Runs to completion even if the client detaches."""
+        try:
+            assert proc.stdout is not None
             while True:
                 raw = await proc.stdout.readline()
                 if not raw:
                     break
-                captured.append(ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n"))
-        await proc.wait()
+                line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
+                captured.append(line)
+                await q.put(("chunk", {"text": line}))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                rc = await proc.wait()
+            except Exception:  # noqa: BLE001
+                rc = -1
+            if RUNNING.get(session) is proc:
+                del RUNNING[session]
+            _buffer_reply(session, "\n".join(captured))
+            await q.put(("eof", {"code": rc}))
+
+    async def poll_tools():
+        """Watch this turn's forked Hermes session and queue new tool events."""
+        while True:
+            await asyncio.sleep(3)
+            try:
+                if not trace["turn_id"]:
+                    nid = await _latest_cli_session_id()
+                    if not nid or nid == pre_id:
+                        continue
+                    trace["turn_id"] = nid
+                events = await _export_turn_events(trace["turn_id"])
+                for ev in events[trace["sent"]:]:
+                    await q.put(("tool", ev))
+                trace["sent"] = len(events)
+            except Exception:  # noqa: BLE001
+                pass
+
+    reader = asyncio.create_task(read_stdout())
+    poller = asyncio.create_task(poll_tools())
+    try:
+        rc = 0
+        while True:
+            kind, data = await q.get()
+            if kind == "eof":
+                rc = data.get("code", 0)
+                break
+            yield sse(kind, data)
+        # Final catch-up: fast turns can finish before the poller ever fires.
+        poller.cancel()
+        try:
+            if not trace["turn_id"]:
+                nid = await _latest_cli_session_id()
+                if nid and nid != pre_id:
+                    trace["turn_id"] = nid
+            if trace["turn_id"]:
+                events = await _export_turn_events(trace["turn_id"])
+                for ev in events[trace["sent"]:]:
+                    yield sse("tool", ev)
+        except Exception:  # noqa: BLE001
+            pass
+        yield sse("done", {"code": rc, "stopped": False})
+    except asyncio.CancelledError:
+        # Client dropped (phone locked / page reloaded). Do NOT kill the turn:
+        # read_stdout keeps draining and buffers the reply for /api/turn
+        # recovery. Deliberate stops go through /api/stop.
+        poller.cancel()
+        raise
+
+
+# Context-window info is expensive to compute (spawns hermes), so cache it.
+CONTEXT_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+@app.get("/api/context")
+async def context_info():
+    """Context-window report: model, configured context length, and the fixed
+    prompt budget (system prompt + skills + memory + tool schemas) that Hermes
+    spends before the conversation even starts. Token counts are estimated at
+    ~4 chars/token. Cached for 5 minutes."""
+    import time
+
+    now = time.time()
+    if CONTEXT_CACHE["data"] and now - CONTEXT_CACHE["ts"] < 300:
+        return CONTEXT_CACHE["data"]
+
+    model, ctx_len = "", 0
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "cat", "/opt/data/config.yaml"), timeout=15)
+        m = re.search(r"^\s*default:\s*(\S+)", out, re.M)
+        if m:
+            model = m.group(1)
+        m = re.search(r"^\s*context_length:\s*(\d+)", out, re.M)
+        if m:
+            ctx_len = int(m.group(1))
     except Exception:  # noqa: BLE001
         pass
-    finally:
-        if RUNNING.get(session) is proc:
-            del RUNNING[session]
-        _buffer_reply(session, "\n".join(captured))
+
+    base_tokens, breakdown = 0, {}
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "prompt-size", "--json"), timeout=60)
+        j = json.loads(out[out.index("{"):])
+        chars = sum(
+            (j.get(k) or {}).get("chars", 0)
+            for k in ("system_prompt", "skills_index", "memory", "user_profile"))
+        tool_bytes = (j.get("tools") or {}).get("json_bytes", 0)
+        base_tokens = round((chars + tool_bytes) / 4)
+        breakdown = {
+            "system_prompt_chars": (j.get("system_prompt") or {}).get("chars", 0),
+            "skills_index_chars": (j.get("skills_index") or {}).get("chars", 0),
+            "tools_json_bytes": tool_bytes,
+            "tool_count": (j.get("tools") or {}).get("count", 0),
+        }
+        if not model:
+            model = j.get("model", "")
+    except Exception:  # noqa: BLE001
+        pass
+
+    data = {"model": model, "context_length": ctx_len,
+            "base_tokens": base_tokens, "breakdown": breakdown}
+    CONTEXT_CACHE.update(ts=now, data=data)
+    return data
 
 
 @app.get("/api/turn/{session}")
