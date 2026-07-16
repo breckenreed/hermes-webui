@@ -163,7 +163,7 @@ let lastTurnKey = null;    // per-turn key of the most recent send (for recovery
    keeps each conversation itself and injects the history into every prompt.
    localStorage:  hermes_convos = [{id,title,updated}]  ·  hermes_msgs_<id> = [{role,text,tools}]
 */
-const CONVOS_LS="hermes_convos", ACTIVE_LS="hermes_active";
+const CONVOS_LS="hermes_convos", ACTIVE_LS="hermes_active", PENDING_LS="hermes_pending";
 const msgsKey = id => "hermes_msgs_"+id;
 let convos = readJSON(CONVOS_LS, []);
 let activeId = localStorage.getItem(ACTIVE_LS) || null;
@@ -348,6 +348,7 @@ function openConvo(id){
   $("#cursession").textContent = convoTitle(id) || "chat";
   renderConversation();
   renderConvos();
+  recoverPending();   // in case this conversation has an interrupted reply
 }
 
 function newConvo(){
@@ -411,8 +412,12 @@ async function send(){
   const aBody=addMsg("assistant"); aBody.innerHTML=`<span class="cursor"></span>`;
   const turnKey = activeId+"__"+Date.now().toString(36);
   lastTurnKey = turnKey;
+  // Persist the in-flight turn so a full page reload (not just a tab suspend)
+  // can still recover the reply the server finishes buffering.
+  writeJSON(PENDING_LS, {convoId: activeId, turnKey});
 
   let finalText="";           // accumulated non-tool output
+  let interrupted=false;
   const toolLines=[];
   function repaint(){
     let html="";
@@ -446,9 +451,9 @@ async function send(){
   }catch(e){
     if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
     else {
-      // Stream dropped (e.g. the phone locked). The turn keeps running on the
-      // server; its reply is buffered and recovered when we return.
-      needsReload = true;
+      // Stream dropped (e.g. phone locked or page reloaded). The turn keeps
+      // running on the server; its reply is buffered and recovered on return.
+      interrupted=true; needsReload=true;
       finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — the reply is still being written; it will reappear when you return_`;
     }
   }finally{
@@ -457,6 +462,8 @@ async function send(){
     // Persist the assistant turn into the conversation history.
     messages.push({role:"assistant", text:finalText, tools:toolLines});
     touchConvo(activeId, null); saveMessages(); renderConvos();
+    // Clear the pending marker unless we were interrupted (then recovery needs it).
+    if(!interrupted){ try{ localStorage.removeItem(PENDING_LS); }catch(e){} }
   }
 }
 function isToolLine(l){
@@ -492,28 +499,47 @@ input.addEventListener("keydown",e=>{
 });
 $("#newchat").onclick=()=>{ newConvo(); };
 
-// When the tab comes back (phone unlocked, refocused) after a dropped stream,
-// recover the reply that finished on the server and slot it into the history.
-async function reloadIfNeeded(){
-  if(!(needsReload && !busy && lastTurnKey)) return;
+/* Recover a reply whose stream was cut (phone lock OR full page reload). The
+   pending turn is persisted in localStorage, so this survives a reload; if the
+   server is still generating, poll until it finishes. */
+let recoverTimer=null;
+async function recoverPending(){
+  if(busy) return;
+  const pending = readJSON(PENDING_LS, null);
+  if(!pending || pending.convoId!==activeId || !pending.turnKey) return;
+  lastTurnKey = pending.turnKey;
   try{
-    const r=await fetch("/api/turn/"+encodeURIComponent(lastTurnKey));
+    const r=await fetch("/api/turn/"+encodeURIComponent(pending.turnKey));
     const j=await r.json();
-    if(j.done){                 // reply finished on the server
+    if(j.done){                                    // finished + buffered
       needsReload=false;
+      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+      if(recoverTimer){ clearTimeout(recoverTimer); recoverTimer=null; }
       if(j.text){
         const {finalText, toolLines}=parseTurn(j.text);
-        if(messages.length && messages[messages.length-1].role==="assistant"){
+        const last=messages[messages.length-1];
+        if(last && last.role==="assistant"){
           messages[messages.length-1]={role:"assistant", text:finalText, tools:toolLines};
-          saveMessages(); renderConversation();
+        } else {
+          messages.push({role:"assistant", text:finalText, tools:toolLines});
         }
+        saveMessages(); renderConversation();
       }
-    } // still running -> leave needsReload set, retry on next focus
-  }catch(e){ /* still offline */ }
+    } else if(j.running){                           // still generating — poll
+      const last=messages[messages.length-1];
+      if(last && last.role==="assistant"){
+        last.text="_⏳ reply still generating on the server…_"; renderConversation();
+      }
+      if(recoverTimer) clearTimeout(recoverTimer);
+      recoverTimer=setTimeout(recoverPending, 3000);
+    } else {                                        // nothing to recover
+      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+    }
+  }catch(e){ if(recoverTimer) clearTimeout(recoverTimer); recoverTimer=setTimeout(recoverPending, 5000); }
 }
-document.addEventListener("visibilitychange",()=>{ if(!document.hidden) reloadIfNeeded(); });
-window.addEventListener("focus", reloadIfNeeded);
-window.addEventListener("pageshow", reloadIfNeeded);
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) recoverPending(); });
+window.addEventListener("focus", recoverPending);
+window.addEventListener("pageshow", recoverPending);
 
 // Startup: restore the active conversation (or the most recent) from storage.
 (function boot(){
@@ -524,6 +550,7 @@ window.addEventListener("pageshow", reloadIfNeeded);
   messages = readJSON(msgsKey(activeId), []);
   $("#cursession").textContent = convoTitle(activeId) || "New chat";
   renderConvos(); renderConversation(); health(); input.focus();
+  recoverPending();   // pick up a reply interrupted before this load
 })();
 setInterval(health,15000);
 </script>
