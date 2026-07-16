@@ -16,15 +16,12 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 
 ## How it works
 
-The webui does **not** reimplement the agent. It shells into your already-running
-Hermes container and runs the one-shot CLI:
+The webui shells into your already-running Hermes container and runs the
+one-shot CLI, streaming `stdout` back to the browser over Server-Sent Events:
 
 ```
-docker exec hermes-agent hermes -z "<your prompt>" --resume <session> --yolo --cli
+docker exec hermes-agent hermes -z "<prompt>" --resume <turn-key> --yolo --cli
 ```
-
-`stdout` is streamed back to the browser over Server-Sent Events. Sessions,
-history, tools, and the LLM connection are all handled by Hermes itself.
 
 ```
 ┌────────────┐     HTTP/SSE     ┌──────────────┐   docker exec   ┌──────────────┐
@@ -34,6 +31,17 @@ history, tools, and the LLM connection are all handled by Hermes itself.
                                         │
                                   /var/run/docker.sock
 ```
+
+### Conversations live in the browser
+
+`hermes -z` is **one-shot**: every invocation forks a fresh session and does
+not reliably carry earlier turns forward (apparent recall comes from Hermes'
+global *memory* feature, not session continuity). So the webui **owns the
+conversation itself** — each chat is stored in the browser's `localStorage`,
+and the full history is **injected into every prompt** as context. This gives
+the model correct, explicit context on every turn, survives reloads and phone
+locks, and means no session cloning. The sidebar lists *your* conversations,
+not Hermes' internal per-turn session rows.
 
 ## Requirements
 
@@ -79,9 +87,10 @@ prepends a short context note to every prompt:
 > inspect or modify the filesystem — never guess about your environment or where
 > files live.
 
-The note is wrapped in internal markers and **stripped from the chat transcript**,
-so you only ever see your own messages. Override it with `HERMES_SYSTEM_PREAMBLE`
-(e.g. to point at a different vault path), or set it empty to turn it off.
+The note rides at the **top of the composed prompt** (ahead of the injected
+conversation history) and never appears in the chat — you only see your own
+messages and the reply. Override it with `HERMES_SYSTEM_PREAMBLE` (e.g. to point
+at a different vault path), or set it empty to turn it off.
 
 Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
 
@@ -98,13 +107,9 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET`  | `/api/health` | Is the Hermes container reachable? |
-| `GET`  | `/api/sessions` | List recent CLI sessions |
-| `GET`  | `/api/session/{id}` | Normalized transcript for one session |
-| `GET`  | `/api/latest-session` | Native id of the most-recent CLI session (used to recover after a dropped connection) |
-| `POST` | `/api/chat` | Send a prompt; streams the reply as SSE. Body: `{"message","session"}` |
-| `POST` | `/api/stop` | Stop the in-flight response for a session (kills the running hermes turn). Body: `{"session"}` |
-| `DELETE` | `/api/session/{id}` | Delete a session |
-| `POST` | `/api/session/{id}/rename` | Rename a session. Body: `{"title"}` |
+| `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}]}` — `session` is a unique per-turn key; `history` is the prior conversation |
+| `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
+| `GET`  | `/api/turn/{session}` | Recover a reply that finished while the client was away. Returns `{done, running, text}` |
 
 ## Security notes
 
