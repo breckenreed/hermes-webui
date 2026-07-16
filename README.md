@@ -11,6 +11,8 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🔁 **Resume any conversation** — sending a message continues that exact session, so context is preserved by Hermes' own session store.
 - 🗂️ **Session actions** — per-session `⋯` menu to **Rename**, **Copy ID**, or **Delete**.
 - ⏹ **Stop** — interrupt a running response mid-stream; the Send button becomes a Stop button while the agent is working.
+- 🛠️ **Live tool trace** — the agent's actions stream into the chat Claude-code style: each tool call (`● write_file {...}`) and its result (`↳ …`) appears as it happens.
+- 📊 **Context meter** — the top bar shows estimated token usage for the current conversation against the model's configured context window (hover for the breakdown: fixed prompt budget vs. history).
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -110,6 +112,7 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}]}` — `session` is a unique per-turn key; `history` is the prior conversation |
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
 | `GET`  | `/api/turn/{session}` | Recover a reply that finished while the client was away. Returns `{done, running, text}` |
+| `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
 
 ## Security notes
 
