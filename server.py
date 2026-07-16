@@ -79,7 +79,8 @@ def _exec_prefix() -> list[str]:
 
 class ChatBody(BaseModel):
     message: str
-    session: str  # stable resume-key for this conversation
+    session: str                      # unique per-turn key (isolation + stop handle)
+    history: list[dict] = []          # prior [{role, text}] turns, injected as context
 
 
 @app.get("/")
@@ -257,20 +258,44 @@ async def rename_session(sid: str, body: RenameBody):
     return JSONResponse({"ok": code == 0, "message": out}, status_code=200 if code == 0 else 500)
 
 
-def _wrap_prompt(message: str) -> str:
-    """Append the (marker-wrapped) system preamble after the user's text.
+def _compose_prompt(history: list[dict], message: str) -> str:
+    """Build a single prompt carrying the whole conversation.
 
-    Appending (rather than prepending) keeps the user's own words at the start
-    of the prompt, so Hermes derives a clean session title from them instead of
-    from our context note. The markers let us strip it back out of transcripts.
+    `hermes -z` is one-shot: each call forks a fresh session and does NOT
+    reliably carry prior turns forward. So the webui owns the conversation and
+    injects the full history into every prompt — that gives the model correct,
+    explicit context regardless of Hermes' session store. The system preamble
+    (if any) rides at the top.
     """
-    if not SYSTEM_PREAMBLE:
-        return message
-    return f"{message}\n\n{PREAMBLE_OPEN}\n{SYSTEM_PREAMBLE}\n{PREAMBLE_CLOSE}"
+    parts: list[str] = []
+    if SYSTEM_PREAMBLE:
+        parts.append(SYSTEM_PREAMBLE)
+    turns = [m for m in (history or []) if (m.get("text") or "").strip()]
+    if turns:
+        parts.append("# Conversation so far")
+        for m in turns:
+            who = "User" if m.get("role") == "user" else "Assistant"
+            parts.append(f"{who}: {m['text'].strip()}")
+        parts.append(
+            "# Now reply to the latest user message below, using the "
+            "conversation above as context."
+        )
+    parts.append(f"User: {message.strip()}")
+    return "\n\n".join(parts)
 
 
 # In-flight chat processes, keyed by session, so the UI can stop them.
 RUNNING: dict[str, asyncio.subprocess.Process] = {}
+# Completed assistant replies, keyed by per-turn session key, so a reply that
+# finished while the client was away (phone locked) can be recovered on return.
+DONE_BUFFERS: dict[str, str] = {}
+_DONE_BUFFERS_MAX = 40
+
+
+def _buffer_reply(session: str, text: str) -> None:
+    DONE_BUFFERS[session] = text
+    while len(DONE_BUFFERS) > _DONE_BUFFERS_MAX:
+        DONE_BUFFERS.pop(next(iter(DONE_BUFFERS)))
 
 
 async def _kill_container_chat(session: str) -> None:
@@ -291,10 +316,15 @@ async def _kill_container_chat(session: str) -> None:
         pass
 
 
-async def _stream_chat(message: str, session: str):
-    """Run the Hermes one-shot CLI and yield SSE events as output arrives."""
+async def _stream_chat(history: list[dict], message: str, session: str):
+    """Run the Hermes one-shot CLI and yield SSE events as output arrives.
+
+    `session` is a unique per-turn key: it isolates this turn's Hermes session
+    (a fresh name starts clean) and is the handle /api/stop uses to kill it.
+    Context comes from the injected history, not from Hermes' session store.
+    """
     args = _exec_prefix() + [
-        "hermes", "-z", _wrap_prompt(message),
+        "hermes", "-z", _compose_prompt(history, message),
         "--resume", session,
         "--yolo", "--cli",
     ]
@@ -319,6 +349,7 @@ async def _stream_chat(message: str, session: str):
 
     RUNNING[session] = proc
     detached = False
+    captured: list[str] = []
     assert proc.stdout is not None
     try:
         while True:
@@ -326,15 +357,15 @@ async def _stream_chat(message: str, session: str):
             if not raw:
                 break
             line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
+            captured.append(line)
             yield sse("chunk", {"text": line})
     except asyncio.CancelledError:
         # The client dropped — e.g. the phone locked and the browser suspended
-        # the tab. Do NOT kill the turn: let it finish server-side so Hermes
-        # saves the full response, and the user can resume the same session
-        # when they come back. Deliberate stops go through /api/stop, which
-        # kills on demand.
+        # the tab. Do NOT kill the turn: let it finish server-side and buffer
+        # the reply so the client can recover it on return. Deliberate stops go
+        # through /api/stop, which kills on demand.
         detached = True
-        asyncio.create_task(_finish_detached(proc, session))
+        asyncio.create_task(_finish_detached(proc, session, captured))
         raise
     finally:
         if not detached:
@@ -344,50 +375,42 @@ async def _stream_chat(message: str, session: str):
                 rc = await proc.wait()
             except Exception:  # noqa: BLE001
                 rc = -1
-            # Hand back the native session id. A conversation started under a
-            # webui_* resume-name lives in a session whose *native* id is what
-            # `sessions export` needs — the client adopts it so reloads (after
-            # a phone lock, say) can restore this exact transcript.
-            nid = await _latest_cli_session_id()
-            yield sse("done", {"code": rc, "stopped": False, "session_id": nid})
+            _buffer_reply(session, "\n".join(captured))
+            yield sse("done", {"code": rc, "stopped": False})
 
 
-async def _finish_detached(proc, session: str) -> None:
+async def _finish_detached(proc, session: str, captured: list[str]) -> None:
     """Drain a chat process to completion after the client left, then reap it.
 
-    Keeps reading stdout so the pipe never fills and blocks hermes mid-turn,
-    letting the response complete and persist to the session store.
+    Keeps reading stdout so the pipe never fills (which would block hermes
+    mid-turn) and buffers the full reply for recovery via /api/turn.
     """
     try:
         if proc.stdout is not None:
-            while await proc.stdout.readline():
-                pass
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                captured.append(ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n"))
         await proc.wait()
     except Exception:  # noqa: BLE001
         pass
     finally:
         if RUNNING.get(session) is proc:
             del RUNNING[session]
+        _buffer_reply(session, "\n".join(captured))
 
 
-async def _latest_cli_session_id() -> str:
-    """Native id of the most-recently-active CLI session (i.e. the one we just
-    drove). Used to translate a webui_* resume-name into an exportable id."""
-    try:
-        code, out = await _run(
-            *_exec_prefix(), "hermes", "sessions", "list",
-            "--source", "cli", "--limit", "1",
-        )
-        m = SESSION_ID_RE.search(out)
-        return m.group(0) if m else ""
-    except Exception:  # noqa: BLE001
-        return ""
+@app.get("/api/turn/{session}")
+async def turn(session: str):
+    """Recover a reply that finished while the client was away (phone locked).
 
-
-@app.get("/api/latest-session")
-async def latest_session():
-    """Newest CLI session id — lets the UI recover the native id after a drop."""
-    return {"id": await _latest_cli_session_id()}
+    `done` is true once the turn's process is no longer running; `text` is the
+    full raw output captured for that per-turn session key.
+    """
+    running = session in RUNNING
+    text = DONE_BUFFERS.get(session, "")
+    return {"done": (not running) and (session in DONE_BUFFERS), "running": running, "text": text}
 
 
 @app.post("/api/chat")
@@ -397,7 +420,7 @@ async def chat(body: ChatBody):
         return JSONResponse({"error": "empty message"}, status_code=400)
     session = body.session.strip() or "webui_default"
     return StreamingResponse(
-        _stream_chat(msg, session),
+        _stream_chat(body.history or [], msg, session),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
