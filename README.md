@@ -13,6 +13,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - ⏹ **Stop** — interrupt a running response mid-stream; the Send button becomes a Stop button while the agent is working.
 - 🛠️ **Live tool trace** — the agent's actions stream into the chat Claude-code style: each tool call (`● write_file {...}`) and its result (`↳ …`) appears as it happens.
 - 📊 **Context meter** — the top bar shows estimated token usage for the current conversation against the model's configured context window (hover for the breakdown: fixed prompt budget vs. history).
+- 🔌 **Disconnect-proof turns** — every turn is recorded server-side (memory + disk). A mobile client that locks, backgrounds, or loses wifi mid-turn reattaches on return: it sees the sub-steps completed so far while the turn is still running, gets the full reply when it finishes, and sees *"Prompt processing failed"* only after the server has checked its records, the live process, and the Hermes session store.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -111,7 +112,8 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `GET`  | `/api/health` | Is the Hermes container reachable? |
 | `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}]}` — `session` is a unique per-turn key; `history` is the prior conversation |
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
-| `GET`  | `/api/turn/{session}` | Recover a reply that finished while the client was away. Returns `{done, running, text}` |
+| `GET`  | `/api/turn/{session}` | Reattach point for a lost turn: `{status: running\|done\|failed, events, text}`. While running, returns completed sub-steps (tool calls/results, interim messages) live; reports `failed` only after checking the record, the live process, and the Hermes session store |
+| `POST` | `/api/turn/{session}/ack` | Confirm receipt of a turn's outcome; the server then drops its record. Until acked, reconnects can replay it |
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
 
 ## Security notes
