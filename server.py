@@ -287,6 +287,18 @@ def _compose_prompt(history: list[dict], message: str) -> str:
 # In-flight chat processes, keyed by session, so the UI can stop them.
 RUNNING: dict[str, asyncio.subprocess.Process] = {}
 
+# Strong references to background tasks (asyncio keeps only weak ones — a
+# task could otherwise be garbage-collected mid-run after its parent scope,
+# e.g. a cancelled SSE generator, goes away).
+BG_TASKS: set = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    BG_TASKS.add(t)
+    t.add_done_callback(BG_TASKS.discard)
+    return t
+
 # ── Turn records ─────────────────────────────────────────────────────────
 # The server is the source of truth for a turn's progress; the SSE stream is
 # just a live view. Mobile clients drop constantly (locked phone, backgrounded
@@ -550,14 +562,22 @@ async def _stream_chat(history: list[dict], message: str, session: str):
             except Exception:  # noqa: BLE001
                 pass
 
-    reader = asyncio.create_task(read_stdout())
-    poller = asyncio.create_task(poll_tools())
+    reader = _spawn(read_stdout())
+    poller = _spawn(poll_tools())
     tasks["poller"] = poller
     try:
         rc = 0
         streamed_tools = 0
         while True:
-            kind, data = await q.get()
+            try:
+                kind, data = await asyncio.wait_for(q.get(), timeout=15)
+            except asyncio.TimeoutError:
+                # Heartbeat: long turns can be silent for many minutes (the
+                # model is thinking). Pings keep the client's stall-watchdog
+                # fed, and writing into a dead socket makes the server notice
+                # a vanished client instead of holding the stream open.
+                yield sse("ping", {})
+                continue
             if kind == "eof":
                 rc = data.get("code", 0)
                 break
