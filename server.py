@@ -286,16 +286,49 @@ def _compose_prompt(history: list[dict], message: str) -> str:
 
 # In-flight chat processes, keyed by session, so the UI can stop them.
 RUNNING: dict[str, asyncio.subprocess.Process] = {}
-# Completed assistant replies, keyed by per-turn session key, so a reply that
-# finished while the client was away (phone locked) can be recovered on return.
-DONE_BUFFERS: dict[str, str] = {}
-_DONE_BUFFERS_MAX = 40
+
+# ── Turn records ─────────────────────────────────────────────────────────
+# The server is the source of truth for a turn's progress; the SSE stream is
+# just a live view. Mobile clients drop constantly (locked phone, backgrounded
+# browser, flaky wifi), so every event is recorded here and mirrored to disk —
+# a reconnecting client (or a restarted webui) replays the record instead of
+# losing the reply. Records: {status: running|done|failed, events, text, code,
+# turn_id, ts}.
+TURNS: dict[str, dict] = {}
+_TURNS_MAX = 60
+TURNS_DIR = Path(os.environ.get("TURNS_DIR", "/tmp/hermes-webui-turns"))
+try:
+    TURNS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:  # noqa: BLE001
+    pass
+TURN_KEY_RE = re.compile(r"[\w.-]{1,120}")
 
 
-def _buffer_reply(session: str, text: str) -> None:
-    DONE_BUFFERS[session] = text
-    while len(DONE_BUFFERS) > _DONE_BUFFERS_MAX:
-        DONE_BUFFERS.pop(next(iter(DONE_BUFFERS)))
+def _persist_turn(key: str, rec: dict) -> None:
+    try:
+        (TURNS_DIR / f"{key}.json").write_text(json.dumps(rec), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _load_turn(key: str) -> dict | None:
+    try:
+        return json.loads((TURNS_DIR / f"{key}.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _drop_turn(key: str) -> None:
+    TURNS.pop(key, None)
+    try:
+        (TURNS_DIR / f"{key}.json").unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _trim_turns() -> None:
+    while len(TURNS) > _TURNS_MAX:
+        TURNS.pop(next(iter(TURNS)))
 
 
 async def _kill_container_chat(session: str) -> None:
@@ -339,11 +372,16 @@ async def _latest_cli_session_id() -> str:
         return ""
 
 
-async def _export_turn_events(sid: str) -> list[dict]:
-    """Ordered tool activity of one Hermes session: calls and their results.
+async def _export_turn(sid: str) -> tuple[list[dict], str]:
+    """Ordered activity of one Hermes session + its final reply text.
 
-    Used to mirror the agent's actions into the chat, Claude-code style. The
-    export is read-only, so polling it mid-turn is safe.
+    Events mirror the agent's actions into the chat, Claude-code style:
+      call    — a tool invocation (name + args)
+      result  — what the tool returned
+      interim — an intermediate assistant message (a finished sub-step),
+                emitted only for messages that are NOT the last one, so the
+                final reply (which arrives via stdout) is never duplicated.
+    Read-only, so polling it mid-turn is safe.
     """
     try:
         out = await _run_out(
@@ -352,10 +390,17 @@ async def _export_turn_events(sid: str) -> list[dict]:
         out = out.strip()
         obj = json.loads(out[out.index("{"):].splitlines()[0])
     except Exception:  # noqa: BLE001
-        return []
+        return [], ""
+    msgs = obj.get("messages", [])
     events: list[dict] = []
-    for m in obj.get("messages", []):
+    final_text = ""
+    for i, m in enumerate(msgs):
         role = m.get("role")
+        last = i == len(msgs) - 1
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        content = (content or "").strip()
         if role == "assistant":
             for tc in (m.get("tool_calls") or []):
                 fn = (tc or {}).get("function", {}) if isinstance(tc, dict) else {}
@@ -365,13 +410,15 @@ async def _export_turn_events(sid: str) -> list[dict]:
                 events.append({"kind": "call",
                                "name": fn.get("name") or "?",
                                "args": str(args or "")[:300]})
+            if content:
+                if last:
+                    final_text = content
+                else:
+                    events.append({"kind": "interim", "text": content[:2000]})
         elif role == "tool":
-            content = m.get("content")
-            if isinstance(content, list):
-                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
             events.append({"kind": "result",
-                           "text": (content or "").replace("\n", " ")[:300]})
-    return events
+                           "text": content.replace("\n", " ")[:300]})
+    return events, final_text
 
 
 async def _stream_chat(history: list[dict], message: str, session: str):
@@ -412,14 +459,46 @@ async def _stream_chat(history: list[dict], message: str, session: str):
         yield sse("done", {})
         return
 
+    import time
+
     RUNNING[session] = proc
     captured: list[str] = []
+    tasks: dict = {}
     q: asyncio.Queue = asyncio.Queue()
-    trace = {"turn_id": "", "sent": 0}
+    rec = {"status": "running", "events": [], "text": "", "code": None,
+           "turn_id": "", "pre_id": pre_id, "ts": time.time()}
+    TURNS[session] = rec
+    _trim_turns()
+    _persist_turn(session, rec)
+
+    def record(kind: str, data: dict) -> None:
+        rec["events"].append({"kind": kind, **data})
+        rec["ts"] = time.time()
+
+    async def finish_record(rc: int) -> None:
+        """Mark the record done; runs whether or not a client is attached."""
+        rec["status"] = "done"
+        rec["code"] = rc
+        rec["text"] = "\n".join(captured)
+        # Late tool/interim events the 3s poller didn't catch yet.
+        try:
+            if not rec["turn_id"]:
+                nid = await _latest_cli_session_id()
+                if nid and nid != pre_id:
+                    rec["turn_id"] = nid
+            if rec["turn_id"]:
+                events, final_text = await _export_turn(rec["turn_id"])
+                known = sum(1 for e in rec["events"] if e.get("kind") != "chunk")
+                rec["events"].extend(events[known:])
+                if not rec["text"] and final_text:
+                    rec["text"] = final_text
+        except Exception:  # noqa: BLE001
+            pass
+        _persist_turn(session, rec)
 
     async def read_stdout():
-        """Drain stdout to the queue; on EOF reap the process and buffer the
-        reply. Runs to completion even if the client detaches."""
+        """Drain stdout to the queue + record. Runs to completion even if the
+        client detaches, then finalizes the record for /api/turn recovery."""
         try:
             assert proc.stdout is not None
             while True:
@@ -428,6 +507,7 @@ async def _stream_chat(history: list[dict], message: str, session: str):
                     break
                 line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
                 captured.append(line)
+                record("chunk", {"text": line})
                 await q.put(("chunk", {"text": line}))
         except Exception:  # noqa: BLE001
             pass
@@ -438,55 +518,65 @@ async def _stream_chat(history: list[dict], message: str, session: str):
                 rc = -1
             if RUNNING.get(session) is proc:
                 del RUNNING[session]
-            _buffer_reply(session, "\n".join(captured))
+            # The poller outlives a detached client on purpose; stop it only
+            # now that the turn is over and the record is being finalized.
+            t = tasks.get("poller")
+            if t:
+                t.cancel()
+            await finish_record(rc)
             await q.put(("eof", {"code": rc}))
 
     async def poll_tools():
-        """Watch this turn's forked Hermes session and queue new tool events."""
+        """Watch this turn's forked Hermes session; queue + record new events
+        (tool calls, tool results, and finished sub-step interim messages)."""
+        sent = 0
         while True:
             await asyncio.sleep(3)
             try:
-                if not trace["turn_id"]:
+                if not rec["turn_id"]:
                     nid = await _latest_cli_session_id()
                     if not nid or nid == pre_id:
                         continue
-                    trace["turn_id"] = nid
-                events = await _export_turn_events(trace["turn_id"])
-                for ev in events[trace["sent"]:]:
+                    rec["turn_id"] = nid
+                    _persist_turn(session, rec)
+                events, _ = await _export_turn(rec["turn_id"])
+                for ev in events[sent:]:
+                    rec["events"].append(ev)
                     await q.put(("tool", ev))
-                trace["sent"] = len(events)
+                if len(events) > sent:
+                    sent = len(events)
+                    rec["ts"] = time.time()
+                    _persist_turn(session, rec)
             except Exception:  # noqa: BLE001
                 pass
 
     reader = asyncio.create_task(read_stdout())
     poller = asyncio.create_task(poll_tools())
+    tasks["poller"] = poller
     try:
         rc = 0
+        streamed_tools = 0
         while True:
             kind, data = await q.get()
             if kind == "eof":
                 rc = data.get("code", 0)
                 break
+            if kind == "tool":
+                streamed_tools += 1
             yield sse(kind, data)
-        # Final catch-up: fast turns can finish before the poller ever fires.
         poller.cancel()
-        try:
-            if not trace["turn_id"]:
-                nid = await _latest_cli_session_id()
-                if nid and nid != pre_id:
-                    trace["turn_id"] = nid
-            if trace["turn_id"]:
-                events = await _export_turn_events(trace["turn_id"])
-                for ev in events[trace["sent"]:]:
-                    yield sse("tool", ev)
-        except Exception:  # noqa: BLE001
-            pass
+        # Replay tool/interim events finish_record added after the live
+        # stream ended (turns faster than the poll interval).
+        non_chunk = [e for e in rec["events"] if e.get("kind") != "chunk"]
+        for ev in non_chunk[streamed_tools:]:
+            yield sse("tool", ev)
         yield sse("done", {"code": rc, "stopped": False})
     except asyncio.CancelledError:
-        # Client dropped (phone locked / page reloaded). Do NOT kill the turn:
-        # read_stdout keeps draining and buffers the reply for /api/turn
-        # recovery. Deliberate stops go through /api/stop.
-        poller.cancel()
+        # Client dropped (phone locked / backgrounded / wifi blip). Do NOT
+        # kill the turn and do NOT stop the poller: both keep running so the
+        # record accumulates sub-step progress for /api/turn reattachment.
+        # read_stdout cancels the poller when the process finishes.
+        # Deliberate stops go through /api/stop.
         raise
 
 
@@ -546,16 +636,89 @@ async def context_info():
     return data
 
 
+async def _turn_alive_in_container(session: str) -> bool:
+    """Is the hermes process for this turn still running inside the container?
+    Covers the case where the webui restarted mid-turn and lost its handle."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            *_exec_prefix(), "pgrep", "-f", "--", f"--resume {session}",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return (await asyncio.wait_for(p.wait(), timeout=15)) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @app.get("/api/turn/{session}")
 async def turn(session: str):
-    """Recover a reply that finished while the client was away (phone locked).
+    """Reattach point for a turn whose stream was lost.
 
-    `done` is true once the turn's process is no longer running; `text` is the
-    full raw output captured for that per-turn session key.
+    Answers "ну що там?" with the server-side truth, checking in order:
+      1. the turn record (memory, then disk — survives a webui restart);
+      2. whether the process is still alive (locally or in the container);
+      3. the Hermes session store itself, via the recorded turn_id — a reply
+         that finished while nobody was attached is recovered from there.
+    Only when every source comes up empty does it report failed=true, which
+    the client renders as "Prompt processing failed."
     """
-    running = session in RUNNING
-    text = DONE_BUFFERS.get(session, "")
-    return {"done": (not running) and (session in DONE_BUFFERS), "running": running, "text": text}
+    if not TURN_KEY_RE.fullmatch(session):
+        return JSONResponse({"error": "bad turn key"}, status_code=400)
+
+    rec = TURNS.get(session) or _load_turn(session)
+    if rec and rec.get("status") == "done":
+        return {"done": True, "running": False, "failed": False,
+                "status": "done", "text": rec.get("text", ""),
+                "events": rec.get("events", []), "code": rec.get("code")}
+
+    alive = session in RUNNING or await _turn_alive_in_container(session)
+    if alive:
+        # Live view for a reattaching client: discover the turn's forked
+        # session if needed and export it fresh, so completed sub-steps show
+        # up without waiting for the background poller's next tick.
+        events: list[dict] = []
+        if rec is not None:
+            TURNS.setdefault(session, rec)
+            if not rec.get("turn_id"):
+                nid = await _latest_cli_session_id()
+                if nid and nid != rec.get("pre_id", ""):
+                    rec["turn_id"] = nid
+                    _persist_turn(session, rec)
+            if rec.get("turn_id"):
+                try:
+                    events, _ = await _export_turn(rec["turn_id"])
+                except Exception:  # noqa: BLE001
+                    events = []
+            if not events:
+                events = [e for e in rec.get("events", []) if e.get("kind") != "chunk"]
+        return {"done": False, "running": True, "failed": False,
+                "status": "running", "text": "", "events": events}
+
+    # Process gone with no finished record — last resort: ask the Hermes
+    # store whether this turn's session holds a completed reply.
+    if rec and rec.get("turn_id"):
+        events, final_text = await _export_turn(rec["turn_id"])
+        if final_text or events:
+            rec.update(status="done", text=final_text or rec.get("text", ""),
+                       events=events, code=rec.get("code") or 0)
+            TURNS[session] = rec
+            _persist_turn(session, rec)
+            return {"done": True, "running": False, "failed": False,
+                    "status": "done", "text": rec["text"],
+                    "events": events, "code": rec["code"]}
+
+    return {"done": False, "running": False, "failed": True,
+            "status": "failed", "text": "", "events": []}
+
+
+@app.post("/api/turn/{session}/ack")
+async def turn_ack(session: str):
+    """Client confirms it received the turn's outcome; the record is dropped.
+    Until acked, the record is kept so reconnects can replay it."""
+    if not TURN_KEY_RE.fullmatch(session):
+        return JSONResponse({"error": "bad turn key"}, status_code=400)
+    _drop_turn(session)
+    return {"ok": True}
 
 
 @app.post("/api/chat")
