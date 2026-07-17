@@ -91,6 +91,8 @@
   #ctxmeter.danger{color:var(--red)}
   .tool.call{border-left-color:var(--accent);color:var(--accent2)}
   .tool.result{border-left-color:#3d4753;color:var(--muted)}
+  .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
   .hint{max-width:820px;margin:6px auto 0;padding:0 20px;color:var(--muted);font-size:11px;font-family:var(--mono)}
   ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:#2a3038;border-radius:5px}
 
@@ -460,11 +462,14 @@ async function send(){
 
   let finalText="";           // accumulated non-tool output
   let interrupted=false;
+  let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
   function repaint(){
     let html="";
     toolLines.forEach(t=> html+=toolHtml(t));
-    html += renderMarkdown(finalText) + (busy?`<span class="cursor"></span>`:"");
+    html += renderMarkdown(finalText);
+    if(busy && !finalText) html += `<div class="status">⏺ ${esc(status)}</div>`;
+    if(busy) html += `<span class="cursor"></span>`;
     aBody.innerHTML=html; scroll();
   }
 
@@ -486,11 +491,15 @@ async function send(){
           else finalText += (finalText?"\n":"") + line;
           repaint();
         } else if(ev.event==="tool"){
-          // Live agent activity, Claude-code style: the command it ran and
-          // what came back.
+          // Live agent activity, Claude-code style: commands, their output,
+          // and finished sub-step messages — without waiting for the turn.
           const d=ev.data||{};
-          if(d.kind==="call") toolLines.push(`● ${d.name}${d.args?" "+d.args:""}`);
+          if(d.kind==="call"){ toolLines.push(`● ${d.name}${d.args?" "+d.args:""}`); status="Working…"; }
           else if(d.kind==="result") toolLines.push(`↳ ${d.text||""}`);
+          else if(d.kind==="interim" && d.text){
+            finalText += (finalText?"\n\n":"") + d.text;
+            status="Generating…";
+          }
           repaint();
         } else if(ev.event==="error"){
           finalText += `\n\n_error: ${ev.data.message}_`; repaint();
@@ -500,10 +509,11 @@ async function send(){
   }catch(e){
     if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
     else {
-      // Stream dropped (e.g. phone locked or page reloaded). The turn keeps
-      // running on the server; its reply is buffered and recovered on return.
+      // Stream dropped (phone locked, backgrounded browser, wifi blip). The
+      // turn keeps running on the server; we reattach and replay from the
+      // server-side turn record.
       interrupted=true; needsReload=true;
-      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — the reply is still being written; it will reappear when you return_`;
+      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — reattaching to the running turn…_`;
     }
   }finally{
     currentAbort=null;
@@ -511,8 +521,13 @@ async function send(){
     // Persist the assistant turn into the conversation history.
     messages.push({role:"assistant", text:finalText, tools:toolLines});
     touchConvo(activeId, null); saveMessages(); renderConvos(); updateCtxMeter();
-    // Clear the pending marker unless we were interrupted (then recovery needs it).
-    if(!interrupted){ try{ localStorage.removeItem(PENDING_LS); }catch(e){} }
+    if(interrupted){
+      recoverPending();          // start re-asking the server right away
+    } else {
+      // Clean completion: confirm receipt so the server can drop the record.
+      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+      fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
+    }
   }
 }
 function isToolLine(l){
@@ -548,10 +563,43 @@ input.addEventListener("keydown",e=>{
 });
 $("#newchat").onclick=()=>{ newConvo(); };
 
-/* Recover a reply whose stream was cut (phone lock OR full page reload). The
-   pending turn is persisted in localStorage, so this survives a reload; if the
-   server is still generating, poll until it finishes. */
+/* ---------- reattach to a lost turn ----------
+   The server keeps a durable record of every turn (status + events + reply).
+   After any drop — phone lock, backgrounded browser, page reload, wifi blip —
+   we re-ask it "ну що там?" until the turn resolves. The server only reports
+   failed=true after checking its records, the live process, AND the Hermes
+   session store; only then do we show "Prompt processing failed." */
 let recoverTimer=null;
+
+function rebuildFromRecord(j){
+  const tools=[]; const interims=[];
+  (j.events||[]).forEach(d=>{
+    if(d.kind==="call") tools.push(`● ${d.name}${d.args?" "+d.args:""}`);
+    else if(d.kind==="result") tools.push(`↳ ${d.text||""}`);
+    else if(d.kind==="interim" && d.text) interims.push(d.text);
+    // "chunk" events are the final reply — covered by j.text
+  });
+  const parsed=parseTurn(j.text||"");
+  parsed.toolLines.forEach(t=>tools.push(t));
+  let text=interims.join("\n\n");
+  if(parsed.finalText) text += (text?"\n\n":"") + parsed.finalText;
+  return {text, tools};
+}
+
+function applyToLastAssistant(msg){
+  const last=messages[messages.length-1];
+  if(last && last.role==="assistant") messages[messages.length-1]={role:"assistant", ...msg};
+  else messages.push({role:"assistant", ...msg});
+  saveMessages(); renderConversation(); updateCtxMeter();
+}
+
+function settlePending(turnKey){
+  needsReload=false;
+  if(recoverTimer){ clearTimeout(recoverTimer); recoverTimer=null; }
+  try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+  fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
+}
+
 async function recoverPending(){
   if(busy) return;
   const pending = readJSON(PENDING_LS, null);
@@ -560,29 +608,19 @@ async function recoverPending(){
   try{
     const r=await fetch("/api/turn/"+encodeURIComponent(pending.turnKey));
     const j=await r.json();
-    if(j.done){                                    // finished + buffered
-      needsReload=false;
-      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
-      if(recoverTimer){ clearTimeout(recoverTimer); recoverTimer=null; }
-      if(j.text){
-        const {finalText, toolLines}=parseTurn(j.text);
-        const last=messages[messages.length-1];
-        if(last && last.role==="assistant"){
-          messages[messages.length-1]={role:"assistant", text:finalText, tools:toolLines};
-        } else {
-          messages.push({role:"assistant", text:finalText, tools:toolLines});
-        }
-        saveMessages(); renderConversation(); updateCtxMeter();
-      }
-    } else if(j.running){                           // still generating — poll
-      const last=messages[messages.length-1];
-      if(last && last.role==="assistant"){
-        last.text="_⏳ reply still generating on the server…_"; renderConversation();
-      }
+    if(j.done){
+      applyToLastAssistant(rebuildFromRecord(j));
+      settlePending(pending.turnKey);
+    } else if(j.running){
+      // Show sub-steps completed so far, then keep asking.
+      const partial=rebuildFromRecord(j);
+      partial.text += (partial.text?"\n\n":"") + "_⏳ still generating on the server…_";
+      applyToLastAssistant(partial);
       if(recoverTimer) clearTimeout(recoverTimer);
-      recoverTimer=setTimeout(recoverPending, 3000);
-    } else {                                        // nothing to recover
-      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+      recoverTimer=setTimeout(recoverPending, 4000);
+    } else if(j.failed){
+      applyToLastAssistant({text:"_❌ Prompt processing failed._", tools:[]});
+      settlePending(pending.turnKey);
     }
   }catch(e){ if(recoverTimer) clearTimeout(recoverTimer); recoverTimer=setTimeout(recoverPending, 5000); }
 }
