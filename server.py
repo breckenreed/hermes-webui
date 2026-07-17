@@ -55,13 +55,14 @@ SYSTEM_PREAMBLE = os.environ.get("HERMES_SYSTEM_PREAMBLE", _DEFAULT_PREAMBLE).st
 # --yolo) and spawns no extra sessions — the same single process just does the
 # work and exits when the plan is done. Override with HERMES_AGENT_DIRECTIVE.
 _DEFAULT_AGENT_DIRECTIVE = (
-    "AUTONOMOUS EXECUTION MODE. Your tools run without confirmation. Complete "
-    "the user's entire request in this single run: if you make a plan or a todo "
-    "list, immediately EXECUTE every item yourself with your tools and keep "
-    "going until all steps are actually done and verified. Do not stop to "
-    "explain, ask, or hand the work back before it is finished. When a todo "
-    "list has pending or in-progress items, continue working — do not produce a "
-    "final answer. Give your final answer only once every step is complete."
+    "AUTONOMOUS EXECUTION MODE. Your tools run without confirmation. Work "
+    "through the user's ENTIRE request: if you make a plan or todo list, "
+    "immediately EXECUTE every item yourself with your tools and keep going "
+    "until all steps are actually done. Do not stop to merely explain what you "
+    "will do next — do it. Prefer taking the next action over narrating it.\n"
+    "COMPLETION SIGNAL: end your reply with the exact token [[TASK_COMPLETE]] "
+    "on its own line ONLY when the whole task is fully finished. If any step "
+    "remains, do NOT emit that token — the system will prompt you to continue."
 )
 AGENT_DIRECTIVE = os.environ.get("HERMES_AGENT_DIRECTIVE", _DEFAULT_AGENT_DIRECTIVE).strip()
 
