@@ -47,6 +47,24 @@ _DEFAULT_PREAMBLE = (
 )
 SYSTEM_PREAMBLE = os.environ.get("HERMES_SYSTEM_PREAMBLE", _DEFAULT_PREAMBLE).strip()
 
+# Completion pressure for "Agent mode". hermes -z is one-shot: within a single
+# run the agent has many tool iterations, but weaker local models tend to make
+# a plan / todo list and then STOP to explain instead of executing it. This
+# directive tells the model to carry the whole plan through in that one run.
+# It changes nothing about safety (tools already run without confirmation under
+# --yolo) and spawns no extra sessions — the same single process just does the
+# work and exits when the plan is done. Override with HERMES_AGENT_DIRECTIVE.
+_DEFAULT_AGENT_DIRECTIVE = (
+    "AUTONOMOUS EXECUTION MODE. Your tools run without confirmation. Complete "
+    "the user's entire request in this single run: if you make a plan or a todo "
+    "list, immediately EXECUTE every item yourself with your tools and keep "
+    "going until all steps are actually done and verified. Do not stop to "
+    "explain, ask, or hand the work back before it is finished. When a todo "
+    "list has pending or in-progress items, continue working — do not produce a "
+    "final answer. Give your final answer only once every step is complete."
+)
+AGENT_DIRECTIVE = os.environ.get("HERMES_AGENT_DIRECTIVE", _DEFAULT_AGENT_DIRECTIVE).strip()
+
 # Markers wrap the preamble in the sent prompt so we can strip it back out when
 # rendering a stored transcript — the user only ever sees their own text.
 PREAMBLE_OPEN = "<<webui-context>>"
@@ -81,6 +99,7 @@ class ChatBody(BaseModel):
     message: str
     session: str                      # unique per-turn key (isolation + stop handle)
     history: list[dict] = []          # prior [{role, text}] turns, injected as context
+    agent_mode: bool = False          # add completion pressure for multi-step / todo work
 
 
 @app.get("/")
@@ -258,18 +277,21 @@ async def rename_session(sid: str, body: RenameBody):
     return JSONResponse({"ok": code == 0, "message": out}, status_code=200 if code == 0 else 500)
 
 
-def _compose_prompt(history: list[dict], message: str) -> str:
+def _compose_prompt(history: list[dict], message: str, agent_mode: bool = False) -> str:
     """Build a single prompt carrying the whole conversation.
 
     `hermes -z` is one-shot: each call forks a fresh session and does NOT
     reliably carry prior turns forward. So the webui owns the conversation and
     injects the full history into every prompt — that gives the model correct,
     explicit context regardless of Hermes' session store. The system preamble
-    (if any) rides at the top.
+    (if any) rides at the top, followed by the agent directive when Agent mode
+    is on.
     """
     parts: list[str] = []
     if SYSTEM_PREAMBLE:
         parts.append(SYSTEM_PREAMBLE)
+    if agent_mode and AGENT_DIRECTIVE:
+        parts.append(AGENT_DIRECTIVE)
     turns = [m for m in (history or []) if (m.get("text") or "").strip()]
     if turns:
         parts.append("# Conversation so far")
@@ -433,7 +455,8 @@ async def _export_turn(sid: str) -> tuple[list[dict], str]:
     return events, final_text
 
 
-async def _stream_chat(history: list[dict], message: str, session: str):
+async def _stream_chat(history: list[dict], message: str, session: str,
+                       agent_mode: bool = False):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives.
 
     `session` is a unique per-turn key: it isolates this turn's Hermes session
@@ -445,7 +468,7 @@ async def _stream_chat(history: list[dict], message: str, session: str):
     live, Claude-code style.
     """
     args = _exec_prefix() + [
-        "hermes", "-z", _compose_prompt(history, message),
+        "hermes", "-z", _compose_prompt(history, message, agent_mode),
         "--resume", session,
         "--yolo", "--cli",
     ]
@@ -748,7 +771,7 @@ async def chat(body: ChatBody):
         return JSONResponse({"error": "empty message"}, status_code=400)
     session = body.session.strip() or "webui_default"
     return StreamingResponse(
-        _stream_chat(body.history or [], msg, session),
+        _stream_chat(body.history or [], msg, session, body.agent_mode),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
