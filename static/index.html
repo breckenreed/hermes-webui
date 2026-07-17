@@ -417,6 +417,8 @@ async function health(){
 
 /* ---------- send / stop ---------- */
 let currentAbort=null;
+let lastEventTs=0;         // last SSE event (incl. server pings every 15s)
+let watchdogAborted=false; // distinguishes a stall-abort from a user Stop
 
 function setBusy(b){
   busy=b;
@@ -440,6 +442,7 @@ async function send(){
   if(!activeId){ activeId=newConvoId(); try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){} messages=[]; }
   setBusy(true);
   currentAbort=new AbortController();
+  watchdogAborted=false; lastEventTs=Date.now();
   input.value=""; input.style.height="auto";
 
   // History = the conversation so far (role/text only); the backend injects it.
@@ -473,6 +476,16 @@ async function send(){
     aBody.innerHTML=html; scroll();
   }
 
+  // Watchdog: if no event (server pings every 15s) arrives for 45s, the
+  // stream is silently dead (mobile suspends the socket without firing an
+  // error). Abort it so the code falls through to server-side reattach.
+  const watchdog=setInterval(()=>{
+    if(Date.now()-lastEventTs > 45000){
+      watchdogAborted=true;
+      if(currentAbort) currentAbort.abort();
+    }
+  }, 5000);
+
   try{
     const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({message:text, session:turnKey, history}), signal:currentAbort.signal});
@@ -480,12 +493,15 @@ async function send(){
     let buf="";
     while(true){
       const {value,done}=await reader.read(); if(done) break;
+      lastEventTs=Date.now();
       buf+=dec.decode(value,{stream:true});
       let idx;
       while((idx=buf.indexOf("\n\n"))>=0){
         const raw=buf.slice(0,idx); buf=buf.slice(idx+2);
         const ev=parseSSE(raw); if(!ev) continue;
-        if(ev.event==="chunk"){
+        if(ev.event==="ping"){
+          // heartbeat only — keeps the watchdog fed
+        } else if(ev.event==="chunk"){
           const line=ev.data.text ?? "";
           if(isToolLine(line)) toolLines.push(line);
           else finalText += (finalText?"\n":"") + line;
@@ -507,15 +523,17 @@ async function send(){
       }
     }
   }catch(e){
-    if(e && e.name==="AbortError"){ finalText += `${finalText?"\n\n":""}_⏹ stopped_`; }
-    else {
-      // Stream dropped (phone locked, backgrounded browser, wifi blip). The
-      // turn keeps running on the server; we reattach and replay from the
+    if(e && e.name==="AbortError" && !watchdogAborted){
+      finalText += `${finalText?"\n\n":""}_⏹ stopped_`;   // deliberate Stop
+    } else {
+      // Stream dropped or went silent (phone locked, backgrounded, wifi blip).
+      // The turn keeps running on the server; reattach and replay from the
       // server-side turn record.
       interrupted=true; needsReload=true;
       finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — reattaching to the running turn…_`;
     }
   }finally{
+    clearInterval(watchdog);
     currentAbort=null;
     setBusy(false); repaint(); input.focus();
     // Persist the assistant turn into the conversation history.
