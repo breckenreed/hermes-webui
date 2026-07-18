@@ -427,6 +427,16 @@ let currentAbort=null;
 let lastEventTs=0;         // last SSE event (incl. server pings every 15s)
 let watchdogAborted=false; // distinguishes a stall-abort from a user Stop
 
+/* Agent-mode auto-continue: the model emits [[TASK_COMPLETE]] only when the
+   whole task is done. While it's absent, the webui re-prompts the model to
+   keep executing — bounded by AGENT_MAX_ROUNDS, sequential (one process at a
+   time), so it stops itself after the last step instead of stalling on a plan. */
+const AGENT_DONE_TOKEN="[[TASK_COMPLETE]]";
+const AGENT_MAX_ROUNDS=8;
+const AGENT_CONTINUE_PROMPT="Continue. Execute the next pending step(s) of your plan now with your tools. Do not stop until every item is complete; then end with [[TASK_COMPLETE]].";
+let agentRounds=0;
+const stripDoneToken = s => (s||"").split(AGENT_DONE_TOKEN).join("").replace(/\n{3,}/g,"\n\n").trim();
+
 function setBusy(b){
   busy=b;
   const btn=$("#send");
@@ -443,25 +453,31 @@ async function stopGeneration(){
   if(currentAbort) currentAbort.abort();
 }
 
-async function send(){
-  const input=$("#input"); const text=input.value.trim();
+async function send(autoMessage){
+  const isAuto = typeof autoMessage === "string";
+  const input=$("#input");
+  const text = isAuto ? autoMessage : input.value.trim();
   if(!text || busy) return;
+  if(!isAuto) agentRounds=0;   // a real user message starts a fresh agent run
   if(!activeId){ activeId=newConvoId(); try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){} messages=[]; }
   setBusy(true);
   currentAbort=new AbortController();
   watchdogAborted=false; lastEventTs=Date.now();
-  input.value=""; input.style.height="auto";
+  if(!isAuto){ input.value=""; input.style.height="auto"; }
 
   // History = the conversation so far (role/text only); the backend injects it.
+  // Auto-continuations don't add a user turn — the model just keeps going from
+  // its own prior output, which is already in the history.
   const history = messages.map(m=>({role:m.role, text:m.text}));
 
-  // Record + render the user turn; title the conversation from its first line.
-  const firstUser = !messages.some(m=>m.role==="user");
-  messages.push({role:"user", text, tools:[]});
-  const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(text);
-  touchConvo(activeId, firstUser ? text.slice(0,60) : null);
-  $("#cursession").textContent = convoTitle(activeId) || "chat";
-  saveMessages(); renderConvos();
+  if(!isAuto){
+    const firstUser = !messages.some(m=>m.role==="user");
+    messages.push({role:"user", text, tools:[]});
+    const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(text);
+    touchConvo(activeId, firstUser ? text.slice(0,60) : null);
+    $("#cursession").textContent = convoTitle(activeId) || "chat";
+    saveMessages(); renderConvos();
+  }
 
   const aBody=addMsg("assistant"); aBody.innerHTML=`<span class="cursor"></span>`;
   const turnKey = activeId+"__"+Date.now().toString(36);
@@ -471,14 +487,15 @@ async function send(){
   writeJSON(PENDING_LS, {convoId: activeId, turnKey});
 
   let finalText="";           // accumulated non-tool output
-  let interrupted=false;
+  let interrupted=false, stopped=false;
   let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
   function repaint(){
     let html="";
     toolLines.forEach(t=> html+=toolHtml(t));
-    html += renderMarkdown(finalText);
-    if(busy && !finalText) html += `<div class="status">⏺ ${esc(status)}</div>`;
+    const shown = stripDoneToken(finalText);   // never flash [[TASK_COMPLETE]]
+    html += renderMarkdown(shown);
+    if(busy && !shown) html += `<div class="status">⏺ ${esc(status)}</div>`;
     if(busy) html += `<span class="cursor"></span>`;
     aBody.innerHTML=html; scroll();
   }
@@ -531,7 +548,7 @@ async function send(){
     }
   }catch(e){
     if(e && e.name==="AbortError" && !watchdogAborted){
-      finalText += `${finalText?"\n\n":""}_⏹ stopped_`;   // deliberate Stop
+      stopped=true; finalText += `${finalText?"\n\n":""}_⏹ stopped_`;   // deliberate Stop
     } else {
       // Stream dropped or went silent (phone locked, backgrounded, wifi blip).
       // The turn keeps running on the server; reattach and replay from the
@@ -542,16 +559,26 @@ async function send(){
   }finally{
     clearInterval(watchdog);
     currentAbort=null;
-    setBusy(false); repaint(); input.focus();
+    const taskComplete = finalText.includes(AGENT_DONE_TOKEN);
+    finalText = stripDoneToken(finalText);
+    setBusy(false); repaint(); if(!isAuto) input.focus();
     // Persist the assistant turn into the conversation history.
     messages.push({role:"assistant", text:finalText, tools:toolLines});
     touchConvo(activeId, null); saveMessages(); renderConvos(); updateCtxMeter();
     if(interrupted){
       recoverPending();          // start re-asking the server right away
     } else {
-      // Clean completion: confirm receipt so the server can drop the record.
       try{ localStorage.removeItem(PENDING_LS); }catch(e){}
       fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
+      // Agent mode: if the model didn't signal completion and it wasn't a
+      // deliberate Stop, drive the next step automatically (bounded).
+      if(agentMode && !stopped && !taskComplete && agentRounds < AGENT_MAX_ROUNDS){
+        agentRounds++;
+        toast(`Agent mode — continuing (round ${agentRounds+1})…`);
+        setTimeout(()=>send(AGENT_CONTINUE_PROMPT), 250);
+      } else if(agentMode && !taskComplete && agentRounds >= AGENT_MAX_ROUNDS){
+        toast(`Agent stopped after ${AGENT_MAX_ROUNDS} auto-continue rounds`);
+      }
     }
   }
 }
