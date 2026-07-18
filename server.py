@@ -19,6 +19,7 @@ This container needs the Docker socket mounted (see docker-compose.yml) so it
 can exec into the Hermes container.
 """
 import asyncio
+import hmac
 import json
 import os
 import re
@@ -75,6 +76,26 @@ PREAMBLE_BLOCK_RE = re.compile(
 )
 
 app = FastAPI(title="Hermes WebUI")
+
+# ── Access control ───────────────────────────────────────────────────────
+# The webui grants full agent access (yolo file writes included) to whoever
+# reaches the port, so on a semi-public LAN it must not be open. When
+# WEBUI_TOKEN is set, every /api/* request needs `Authorization: Bearer
+# <token>`; the page shell itself stays public (it holds no data — it shows a
+# lock screen until the token is entered). Empty token = open access, for
+# localhost-only setups.
+WEBUI_TOKEN = os.environ.get("WEBUI_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def require_token(request: Request, call_next):
+    if WEBUI_TOKEN and request.url.path.startswith("/api/"):
+        supplied = request.headers.get("authorization", "")
+        if supplied.startswith("Bearer "):
+            supplied = supplied[7:]
+        if not hmac.compare_digest(supplied, WEBUI_TOKEN):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 # Matches Hermes session IDs like 20260715_193102_62eba9
 SESSION_ID_RE = re.compile(r"\d{8}_\d{6}_[0-9a-f]{6}")
@@ -802,4 +823,15 @@ async def stop(body: StopBody):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    kwargs: dict = {}
+    # WEBUI_TLS=1 serves HTTPS with the self-signed cert the entrypoint
+    # generates, so the auth token and conversation content aren't sniffable
+    # on the LAN. Browsers warn once about the self-signed cert; accept it.
+    if os.environ.get("WEBUI_TLS", "") == "1":
+        cert = Path("/app/certs/server.crt")
+        key = Path("/app/certs/server.key")
+        if cert.exists() and key.exists():
+            kwargs = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+        else:
+            print("WEBUI_TLS=1 but no cert found — serving plain HTTP", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), **kwargs)

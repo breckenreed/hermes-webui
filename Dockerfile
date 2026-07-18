@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # We install only the static client binary (no daemon) — it talks to the
 # host's Docker Engine through the mounted socket.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl \
+        ca-certificates curl openssl \
     && install -m0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -19,6 +19,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY static ./static
+COPY docker-entrypoint.sh .
+RUN chmod +x docker-entrypoint.sh
 
 EXPOSE 8000
-CMD ["python", "server.py"]
+CMD ["./docker-entrypoint.sh"]
