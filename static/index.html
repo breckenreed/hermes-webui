@@ -4,6 +4,8 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hermes · WebUI</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0f12'/%3E%3Cpath d='M16 5l9.5 5.5v11L16 27l-9.5-5.5v-11z' fill='none' stroke='%23e07b39' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M12 11v10M20 11v10M12 16h8' stroke='%23f0a868' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+<meta name="theme-color" content="#0d0f12" />
 <style>
   :root{
     --bg:#0d0f12; --panel:#14171c; --panel2:#191d23; --border:#252b33;
@@ -91,6 +93,8 @@
   #ctxmeter.danger{color:var(--red)}
   .tool.call{border-left-color:var(--accent);color:var(--accent2)}
   .tool.result{border-left-color:#3d4753;color:var(--muted)}
+  .tool .ts{color:#5a6570}
+  .msgtime{color:#5a6570;font-family:var(--mono);font-size:10.5px;margin-top:6px}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
   #agentbtn{background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:10px;
@@ -345,7 +349,7 @@ function showEmpty(){
 function renderConversation(){
   if(!messages.length){ showEmpty(); return; }
   messagesEl.innerHTML="";
-  messages.forEach(m=> renderMessage(m.role, m.text, m.tools));
+  messages.forEach(m=> renderMessage(m.role, m.text, m.tools, m.ts));
   scroll();
 }
 function addMsg(role){
@@ -429,18 +433,32 @@ function renameConvo(c){
   toast("Renamed");
 }
 
-/* Claude-style tool line: "● name {args}" = a call, "↳ …" = its output */
+/* Local wall-clock HH:MM:SS from an epoch (s or ms) or now. */
+function fmtClock(ts){
+  const d = ts ? new Date(ts < 1e12 ? ts*1000 : ts) : new Date();
+  const p=n=>String(n).padStart(2,"0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function fmtElapsed(sec){
+  sec=Math.max(0,Math.round(sec));
+  return sec<60 ? `${sec}s` : `${Math.floor(sec/60)}m ${sec%60}s`;
+}
+/* A tool line may carry a leading "HH:MM:SS " — split it out and dim it. */
 function toolHtml(t){
-  const cls = t.startsWith("●") ? "tool call" : (t.startsWith("↳") ? "tool result" : "tool");
-  return `<div class="${cls}">${esc(t)}</div>`;
+  const m = t.match(/^(\d{2}:\d{2}:\d{2})\s+([\s\S]*)$/);
+  const time = m ? m[1] : "";
+  const body = m ? m[2] : t;
+  const cls = body.startsWith("●") ? "tool call" : (body.startsWith("↳") ? "tool result" : "tool");
+  return `<div class="${cls}">${time?`<span class="ts">${time}</span> `:""}${esc(body)}</div>`;
 }
 
-/* render a full transcript message (with optional tool lines) */
-function renderMessage(role, text, tools){
+/* render a full transcript message (with optional tool lines + a time footer) */
+function renderMessage(role, text, tools, ts){
   const body=addMsg(role==="user"?"user":"assistant");
   let html="";
   (tools||[]).forEach(t=> html+=toolHtml(t));
   if(text) html += renderMarkdown(text);
+  if(ts && role!=="user") html += `<div class="msgtime">${fmtClock(ts)}</div>`;
   body.innerHTML=html;
 }
 
@@ -587,10 +605,10 @@ async function send(autoMessage){
           repaint();
         } else if(ev.event==="tool"){
           // Live agent activity, Claude-code style: commands, their output,
-          // and finished sub-step messages — without waiting for the turn.
-          const d=ev.data||{};
-          if(d.kind==="call"){ toolLines.push(`● ${d.name}${d.args?" "+d.args:""}`); status="Working…"; }
-          else if(d.kind==="result") toolLines.push(`↳ ${d.text||""}`);
+          // and finished sub-step messages — each stamped with its time.
+          const d=ev.data||{}; const t=fmtClock(d.ts);
+          if(d.kind==="call"){ toolLines.push(`${t}  ● ${d.name}${d.args?" "+d.args:""}`); status=`Running tool: ${d.name}`; }
+          else if(d.kind==="result"){ toolLines.push(`${t}  ↳ ${d.text||""}`); status="Processing result…"; }
           else if(d.kind==="interim" && d.text){
             finalText += (finalText?"\n\n":"") + d.text;
             status="Generating…";
@@ -617,8 +635,9 @@ async function send(autoMessage){
     const taskComplete = finalText.includes(AGENT_DONE_TOKEN);
     finalText = stripDoneToken(finalText);
     setBusy(false); repaint(); if(!isAuto) input.focus();
-    // Persist the assistant turn into the conversation history.
-    messages.push({role:"assistant", text:finalText, tools:toolLines});
+    // Persist the assistant turn into the conversation history (with a
+    // completion timestamp shown under the message).
+    messages.push({role:"assistant", text:finalText, tools:toolLines, ts:Date.now()});
     touchConvo(activeId, null); saveMessages(); renderConvos(); updateCtxMeter();
     if(interrupted){
       recoverPending();          // start re-asking the server right away
@@ -691,8 +710,9 @@ let recoverTimer=null;
 function rebuildFromRecord(j){
   const tools=[]; const interims=[];
   (j.events||[]).forEach(d=>{
-    if(d.kind==="call") tools.push(`● ${d.name}${d.args?" "+d.args:""}`);
-    else if(d.kind==="result") tools.push(`↳ ${d.text||""}`);
+    const t=fmtClock(d.ts);
+    if(d.kind==="call") tools.push(`${t}  ● ${d.name}${d.args?" "+d.args:""}`);
+    else if(d.kind==="result") tools.push(`${t}  ↳ ${d.text||""}`);
     else if(d.kind==="interim" && d.text) interims.push(d.text);
     // "chunk" events are the final reply — covered by j.text
   });
@@ -729,9 +749,11 @@ async function recoverPending(){
       applyToLastAssistant(rebuildFromRecord(j));
       settlePending(pending.turnKey);
     } else if(j.running){
-      // Show sub-steps completed so far, then keep asking.
+      // Show sub-steps completed so far + the real current condition (which
+      // tool / generating), with elapsed time — not just "still generating".
       const partial=rebuildFromRecord(j);
-      partial.text += (partial.text?"\n\n":"") + "_⏳ still generating on the server…_";
+      const elapsed = j.started ? ` · ${fmtElapsed(Date.now()/1000 - j.started)}` : "";
+      partial.text += (partial.text?"\n\n":"") + `_⏳ ${j.label || "Working…"}${elapsed} (running on the server)_`;
       applyToLastAssistant(partial);
       if(recoverTimer) clearTimeout(recoverTimer);
       recoverTimer=setTimeout(recoverPending, 4000);
