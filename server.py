@@ -501,14 +501,16 @@ async def _stream_chat(history: list[dict], message: str, session: str,
     tasks: dict = {}
     q: asyncio.Queue = asyncio.Queue()
     rec = {"status": "running", "events": [], "text": "", "code": None,
-           "turn_id": "", "pre_id": pre_id, "ts": time.time()}
+           "turn_id": "", "pre_id": pre_id, "ts0": time.time(), "ts": time.time()}
     TURNS[session] = rec
     _trim_turns()
     _persist_turn(session, rec)
 
-    def record(kind: str, data: dict) -> None:
-        rec["events"].append({"kind": kind, **data})
-        rec["ts"] = time.time()
+    def record(kind: str, data: dict) -> dict:
+        ev = {"kind": kind, "ts": time.time(), **data}
+        rec["events"].append(ev)
+        rec["ts"] = ev["ts"]
+        return ev
 
     async def finish_record(rc: int) -> None:
         """Mark the record done; runs whether or not a client is attached."""
@@ -524,7 +526,9 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             if rec["turn_id"]:
                 events, final_text = await _export_turn(rec["turn_id"])
                 known = sum(1 for e in rec["events"] if e.get("kind") != "chunk")
-                rec["events"].extend(events[known:])
+                for ev in events[known:]:
+                    ev.setdefault("ts", time.time())
+                    rec["events"].append(ev)
                 if not rec["text"] and final_text:
                     rec["text"] = final_text
         except Exception:  # noqa: BLE001
@@ -542,8 +546,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                     break
                 line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
                 captured.append(line)
-                record("chunk", {"text": line})
-                await q.put(("chunk", {"text": line}))
+                await q.put(("chunk", record("chunk", {"text": line})))
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -576,6 +579,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                     _persist_turn(session, rec)
                 events, _ = await _export_turn(rec["turn_id"])
                 for ev in events[sent:]:
+                    ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
                     await q.put(("tool", ev))
                 if len(events) > sent:
@@ -693,6 +697,21 @@ async def _turn_alive_in_container(session: str) -> bool:
         return False
 
 
+def _status_label(events: list[dict]) -> str:
+    """A human label for what the turn is doing right now, from its last event."""
+    for e in reversed(events or []):
+        k = e.get("kind")
+        if k == "call":
+            return f"Running tool: {e.get('name', '?')}"
+        if k == "result":
+            return "Processing tool result"
+        if k == "interim":
+            return "Working…"
+        if k == "chunk":
+            return "Generating response…"
+    return "Processing prompt…"
+
+
 @app.get("/api/turn/{session}")
 async def turn(session: str):
     """Reattach point for a turn whose stream was lost.
@@ -734,8 +753,11 @@ async def turn(session: str):
                     events = []
             if not events:
                 events = [e for e in rec.get("events", []) if e.get("kind") != "chunk"]
+        label = _status_label(rec.get("events", []) if rec else events)
         return {"done": False, "running": True, "failed": False,
-                "status": "running", "text": "", "events": events}
+                "status": "running", "label": label,
+                "started": (rec or {}).get("ts0") or (rec or {}).get("ts"),
+                "text": "", "events": events}
 
     # Process gone with no finished record — last resort: ask the Hermes
     # store whether this turn's session holds a completed reply.
