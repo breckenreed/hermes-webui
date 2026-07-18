@@ -11,7 +11,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🔁 **Resume any conversation** — sending a message continues that exact session, so context is preserved by Hermes' own session store.
 - 🗂️ **Session actions** — per-session `⋯` menu to **Rename**, **Copy ID**, or **Delete**.
 - ⏹ **Stop** — interrupt a running response mid-stream; the Send button becomes a Stop button while the agent is working.
-- ⚡ **Agent mode** — a composer toggle for multi-step / todo work. `hermes -z` is one-shot, and weaker local models tend to plan (write a todo list) and then stop instead of executing it. When on, the webui adds a completion directive so the model carries the whole plan through in that single run. No extra sessions, no change to `--yolo` — the same one process does the work and exits when the plan is done. Override the wording with `HERMES_AGENT_DIRECTIVE`.
+- ⚡ **Agent mode** — a composer toggle for multi-step / todo work. `hermes -z` is one-shot, and weaker local models tend to plan (write a todo list) and then stop — narrating "next I'll…" instead of doing it. When on, the webui (a) adds a directive telling the model to execute its whole plan and emit `[[TASK_COMPLETE]]` only when finished, and (b) **auto-continues** — while that token is absent it re-prompts the model to run the next step, one process at a time, bounded by a round cap, so it drives itself to the end and stops after the last step. No extra sessions, no change to `--yolo`. Override the directive with `HERMES_AGENT_DIRECTIVE`.
 - 🛠️ **Live tool trace** — the agent's actions stream into the chat Claude-code style: each tool call (`● write_file {...}`) and its result (`↳ …`) appears as it happens.
 - 📊 **Context meter** — the top bar shows estimated token usage for the current conversation against the model's configured context window (hover for the breakdown: fixed prompt budget vs. history).
 - 🕒 **Timestamps & live status** — every tool call/result is stamped `HH:MM:SS` and each reply shows a completion time. On reconnect the chat shows the *actual* current condition (`Running tool: write_file`, `Generating response…`) with elapsed time, instead of a flat "still generating".
@@ -79,6 +79,8 @@ Set in `docker-compose.yml` (or via environment):
 | `LLM_CLIENT_UID` | *(from `.env`)* | Passed through to `hermes` so the agent can reach its LLM endpoint |
 | `HERMES_MODEL` | *(empty)* | Optional model override (e.g. `google/gemma-4-12b`); blank uses the Hermes default |
 | `HERMES_SYSTEM_PREAMBLE` | *(built-in default)* | Short context note prepended to every prompt so small local models use their tools instead of guessing their environment. Set to an empty string to disable |
+| `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
+| `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
 
 ### System preamble
 
@@ -120,13 +122,28 @@ The FastAPI backend also exposes a small JSON API you can script against:
 
 ## Security notes
 
-- **Keep `.env` out of git.** It holds your `LLM_CLIENT_UID`. This repo ships a
-  `.gitignore` that excludes it and an `.env.example` to copy from.
+- **Set `WEBUI_TOKEN` on any shared network.** The webui grants full agent
+  access (including yolo file writes) to whoever reaches the port. With a token
+  set, every `/api/*` request must carry `Authorization: Bearer <token>`; the
+  browser shows a lock screen once and remembers the token. Generate one with
+  `openssl rand -hex 24`.
+- **Enable `WEBUI_TLS=1` on semi-public LANs.** Plain HTTP exposes the token
+  and chat content to sniffing/MITM. With TLS on, the container generates a
+  self-signed cert at first start (kept inside the container) and serves
+  HTTPS on the same port — browsers warn once about the cert; accept it.
+- **Keep `.env` out of git.** It holds your `LLM_CLIENT_UID` and `WEBUI_TOKEN`.
+  This repo ships a `.gitignore` that excludes it and an `.env.example`.
 - Chat runs the agent with `--yolo` (no per-tool confirmation), matching the
-  hands-off "command my agent" use case. Run the webui only on trusted/local
-  networks; it grants full agent access to anyone who can reach the port.
-- Mounting the Docker socket gives the container control over the Docker engine.
-  This is required for `docker exec`; only run it locally.
+  hands-off "command my agent" use case.
+- Mounting the Docker socket gives the container control over the Docker
+  engine. This is required for `docker exec`; only run it locally.
+- **The Hermes ↔ LLM leg is separate.** The webui never talks to the LLM —
+  `webui ↔ hermes` is a local `docker exec` on the same machine. But Hermes
+  itself calls your LM Studio server over the LAN with a bearer key; to protect
+  that hop, put both machines on a [Tailscale](https://tailscale.com) tailnet
+  (WireGuard-encrypted) and point Hermes' `base_url` at the tailnet address,
+  or use an SSH tunnel. An LM Studio *client* install cannot act as a relay
+  for other apps.
 
 ## Project layout
 
