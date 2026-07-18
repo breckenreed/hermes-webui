@@ -12,6 +12,12 @@ services:
       - HERMES_CONTAINER=hermes-agent
       # Passed through to `hermes` so the agent can reach the LLM endpoint
       - LLM_CLIENT_UID=${LLM_CLIENT_UID}
+      # Access token for the webui itself. REQUIRED on any shared network —
+      # without it, anyone who can reach the port gets full agent access.
+      - WEBUI_TOKEN=${WEBUI_TOKEN:-}
+      # 1 = serve HTTPS with a self-signed cert (protects the token and chat
+      # content from LAN sniffing; browsers warn once — accept the cert).
+      - WEBUI_TLS=${WEBUI_TLS:-0}
       # Optional: pin a model, e.g. google/gemma-4-12b (blank = use Hermes default)
       - HERMES_MODEL=
       # Context note prepended to every prompt so small local models use their
