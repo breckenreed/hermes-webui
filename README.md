@@ -16,6 +16,8 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 📊 **Context meter** — the top bar shows estimated token usage for the current conversation against the model's configured context window (hover for the breakdown: fixed prompt budget vs. history).
 - 🕒 **Timestamps & live status** — every tool call/result is stamped `HH:MM:SS` and each reply shows a completion time. On reconnect the chat shows the *actual* current condition (`Running tool: write_file`, `Generating response…`) with elapsed time, instead of a flat "still generating".
 - 🔌 **Disconnect-proof turns** — every turn is recorded server-side (memory + disk). A mobile client that locks, backgrounds, or loses wifi mid-turn reattaches on return: it sees the sub-steps completed so far while the turn is still running, gets the full reply when it finishes, and sees *"Prompt processing failed"* only after the server has checked its records, the live process, and the Hermes session store.
+- 🧵➕🧵 **True multi-conversation concurrency** — every turn is tracked per conversation, not globally. Switch chats freely while a turn is running elsewhere; each one keeps streaming, recovering, and saving to *its own* history. (Earlier versions used a single global "busy"/message-list, so a turn that outlived a conversation switch — new tab, reload + immediate switch — could apply its reply to whatever chat was on screen when it finished. Fixed.)
+- ⌨️ **Slash commands** — `/queue <text>` lines up a follow-up that sends automatically the moment the current turn finishes; `/steer <text>` stops the current step and immediately redirects the agent with a new instruction (plus whatever partial output it had produced) instead of waiting for it to finish; `/stop` stops the running turn. Autocompletes as you type `/`.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -47,6 +49,28 @@ and the full history is **injected into every prompt** as context. This gives
 the model correct, explicit context on every turn, survives reloads and phone
 locks, and means no session cloning. The sidebar lists *your* conversations,
 not Hermes' internal per-turn session rows.
+
+Every in-flight turn is tracked **per conversation** (`convoId -> {turnKey,
+abort, ...}`), never as one global "busy" flag. That's what lets you freely
+switch chats while one is still running — each turn streams, recovers, and
+saves to its own conversation's storage regardless of which one is on screen
+when it resolves — and it's what makes `/queue` and `/steer` possible.
+
+### Slash commands
+
+Type these into the composer:
+
+| Command | What it does |
+|---|---|
+| `/queue <text>` | Sends `<text>` as a normal follow-up message the moment the current turn finishes. Useful for typing ahead instead of waiting. Multiple `/queue` calls append to one another. |
+| `/steer <text>` | Stops the current step and immediately re-prompts the model with `<text>`, including whatever partial output/tool trace it had produced so far. `hermes -z` can't be interrupted mid-generation (it isn't reading stdin while it runs), so this is "stop + redirect with context," not true mid-stream steering — that's the honest limit of the one-shot-process architecture. |
+| `/stop` | Stops the turn running in the current conversation. Same as clicking the Send button while it shows ■. |
+
+Autocomplete appears as soon as you type `/`; arrow keys to select, Tab/Enter
+to fill in the command name. Both commands work even while a turn from the
+*same* conversation is already streaming (that's the point) — sending a plain
+message into a busy conversation is still blocked, with a toast pointing you
+at `/queue`/`/steer` instead.
 
 ## Requirements
 
