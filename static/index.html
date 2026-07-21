@@ -79,7 +79,7 @@
 
   /* Composer */
   #composer{border-top:1px solid var(--border);background:var(--panel);padding:14px 0}
-  #composer .wrap{display:flex;gap:10px;align-items:flex-end}
+  #composer .wrap{display:flex;gap:10px;align-items:flex-end;position:relative}
   #input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:10px;color:var(--text);
     font-family:var(--sans);font-size:14px;padding:11px 14px;resize:none;max-height:200px;line-height:1.5;outline:none}
   #input:focus{border-color:var(--accent)}
@@ -104,6 +104,20 @@
   #agentbtn.on{background:rgba(224,123,57,.16);color:var(--accent2);border-color:var(--accent)}
   .hint{max-width:820px;margin:6px auto 0;padding:0 20px;color:var(--muted);font-size:11px;font-family:var(--mono)}
   ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:#2a3038;border-radius:5px}
+
+  .queuebar{max-width:820px;margin:0 auto 6px;padding:7px 12px;border-radius:8px;background:rgba(224,123,57,.12);
+    border:1px solid var(--accent);color:var(--accent2);font-size:12px;font-family:var(--mono);
+    display:flex;align-items:center;gap:10px}
+  .queuebar #queuetext{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .queuebar button{background:none;border:none;color:var(--accent2);cursor:pointer;font-size:14px;padding:0 4px;flex:0 0 auto}
+  .queuebar button:hover{color:var(--text)}
+
+  .slashmenu{position:absolute;bottom:100%;left:0;right:0;margin-bottom:6px;background:var(--panel2);
+    border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px rgba(0,0,0,.5);z-index:20}
+  .slashmenu .item{padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px}
+  .slashmenu .item:hover,.slashmenu .item.sel{background:var(--panel)}
+  .slashmenu .item b{color:var(--accent2);font-family:var(--mono)}
+  .slashmenu .item small{display:block;color:var(--muted);font-size:11px;margin-top:1px}
 
   /* Lock screen (shown when the backend requires an access token) */
   #lock{display:none;position:fixed;inset:0;background:var(--bg);z-index:100;align-items:center;justify-content:center}
@@ -186,7 +200,11 @@
         <button id="agentbtn" title="Agent mode: push the model to execute multi-step / todo plans to completion in one run">⚡ Agent</button>
         <button id="send" title="Send">➤</button>
       </div>
-      <div class="hint">Runs <code>hermes -z … --resume &lt;session&gt; --yolo</code> inside the container.</div>
+      <div class="queuebar" id="queuebar" style="display:none">
+        <span id="queuetext"></span>
+        <button id="queuecancel" title="Cancel">✕</button>
+      </div>
+      <div class="hint">Runs <code>hermes -z … --resume &lt;session&gt; --yolo</code> inside the container. Type <code>/queue &lt;text&gt;</code> to line up a follow-up, or <code>/steer &lt;text&gt;</code> to redirect the current step.</div>
     </div>
   </section>
 
@@ -227,9 +245,18 @@ document.addEventListener("DOMContentLoaded",()=>{
   $("#lockbtn").onclick=tryUnlock;
   $("#lockinput").addEventListener("keydown",e=>{ if(e.key==="Enter") tryUnlock(); });
 });
-let busy = false;
-let needsReload = false;   // set after a dropped connection; recover on return
-let lastTurnKey = null;    // per-turn key of the most recent send (for recovery)
+/* In-flight turns are tracked PER CONVERSATION (convoId -> record), never as
+   a single global. Earlier versions used one global `busy`/`messages`/
+   `activeId`, which meant an async send()/recoverPending() call that outlived
+   a conversation switch (new tab, quick re-login + switch, etc.) would apply
+   its result to whatever conversation happened to be active when it finished
+   — corrupting the WRONG chat with another chat's reply ("phantom messages").
+   Every write below is keyed by the conversation the turn actually belongs
+   to (`forConvo`), snapshotted at call time and re-checked before any DOM
+   write; only the live-in-storage data uses that id, never the live global
+   `activeId`. */
+const inFlight = new Map();   // convoId -> {turnKey, abort, watchdogAborted, lastEventTs, userStopped, steering, steerText, queued}
+function isBusy(id){ return inFlight.has(id); }
 
 /* ---------- conversation store (owned by the webui, persisted locally) ----------
    hermes -z is one-shot and does not carry context across turns, so the webui
@@ -246,8 +273,13 @@ let agentMode = localStorage.getItem(AGENT_LS)==="1";   // completion pressure f
 function readJSON(k, d){ try{ return JSON.parse(localStorage.getItem(k)) ?? d; }catch(e){ return d; } }
 function writeJSON(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){ /* private mode / quota */ } }
 function newConvoId(){ return "c_"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
-function saveMessages(){ writeJSON(msgsKey(activeId), messages); }
 function convoTitle(id){ const c=convos.find(x=>x.id===id); return c ? c.title : null; }
+// Storage is always the source of truth for a conversation's messages. These
+// helpers never touch the global `messages`/`activeId` — callers decide
+// separately whether the conversation they're writing is also the one on
+// screen right now (see isActive() usages in send()/recoverPending()).
+function loadMsgs(id){ return readJSON(msgsKey(id), []); }
+function saveMsgs(id, arr){ writeJSON(msgsKey(id), arr); if(id===activeId) messages=arr; }
 
 function touchConvo(id, title){
   let c = convos.find(x=>x.id===id);
@@ -415,6 +447,9 @@ function deleteConvo(c){
   convos = convos.filter(x=>x.id!==c.id);
   writeJSON(CONVOS_LS, convos);
   try{ localStorage.removeItem(msgsKey(c.id)); }catch(e){}
+  clearPending(c.id);
+  const t=recoverTimers.get(c.id); if(t){ clearTimeout(t); recoverTimers.delete(c.id); }
+  const rec=inFlight.get(c.id); if(rec){ rec.userStopped=true; rec.abort.abort(); }
   if(c.id===activeId){
     if(convos.length) openConvo(convos[0].id);
     else newConvo();
@@ -463,15 +498,20 @@ function renderMessage(role, text, tools, ts){
 }
 
 function openConvo(id){
-  if(busy) return;
+  // Switching conversations is always allowed, even while another (or this)
+  // conversation has a turn running in the background — that turn keeps
+  // going server-side and in this tab's send() call regardless of which
+  // conversation is on screen; see the inFlight map.
   toggleSidebar(false);
   activeId=id; try{ localStorage.setItem(ACTIVE_LS, id); }catch(e){}
-  messages = readJSON(msgsKey(id), []);
+  messages = loadMsgs(id);
   $("#cursession").textContent = convoTitle(id) || "chat";
   renderConversation();
   renderConvos();
   updateCtxMeter();
-  recoverPending();   // in case this conversation has an interrupted reply
+  syncComposerUI();
+  updateQueueBar();
+  recoverPending(id);   // in case this conversation has an interrupted reply
 }
 
 function newConvo(){
@@ -483,6 +523,8 @@ function newConvo(){
   showEmpty();
   renderConvos();
   updateCtxMeter();
+  syncComposerUI();
+  updateQueueBar();
   $("#input").focus();
 }
 
@@ -495,10 +537,7 @@ async function health(){
   }catch(e){ $("#statustext").textContent="backend offline"; }
 }
 
-/* ---------- send / stop ---------- */
-let currentAbort=null;
-let lastEventTs=0;         // last SSE event (incl. server pings every 15s)
-let watchdogAborted=false; // distinguishes a stall-abort from a user Stop
+/* ---------- send / stop (per conversation) ---------- */
 
 /* Agent-mode auto-continue: the model emits [[TASK_COMPLETE]] only when the
    whole task is done. While it's absent, the webui re-prompts the model to
@@ -510,87 +549,175 @@ const AGENT_CONTINUE_PROMPT="Continue. Execute the next pending step(s) of your 
 let agentRounds=0;
 const stripDoneToken = s => (s||"").split(AGENT_DONE_TOKEN).join("").replace(/\n{3,}/g,"\n\n").trim();
 
-function setBusy(b){
-  busy=b;
-  const btn=$("#send");
-  if(b){ btn.classList.add("stopping"); btn.textContent="■"; btn.title="Stop"; }
-  else { btn.classList.remove("stopping"); btn.textContent="➤"; btn.title="Send"; }
+// Reflects the ACTIVE conversation's in-flight state on the Send/Stop button
+// — each conversation's own busy state lives in inFlight, this just mirrors
+// whichever one is currently on screen.
+function syncComposerUI(){
+  const btn=$("#send"), b=isBusy(activeId);
+  btn.classList.toggle("stopping", b);
+  btn.textContent = b ? "■" : "➤";
+  btn.title = b ? "Stop" : "Send";
 }
 
-async function stopGeneration(){
-  // Ask the backend to kill the running turn, then abort the stream.
-  try{
-    if(lastTurnKey) await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({session:lastTurnKey})});
-  }catch(e){ /* ignore */ }
-  if(currentAbort) currentAbort.abort();
+function updateQueueBar(){
+  const bar=$("#queuebar"); const rec=inFlight.get(activeId);
+  if(rec && rec.queued){
+    bar.style.display="flex";
+    $("#queuetext").textContent = "Queued: "+rec.queued;
+  } else {
+    bar.style.display="none";
+  }
+}
+$("#queuecancel").onclick=()=>{
+  const rec=inFlight.get(activeId);
+  if(rec){ rec.queued=null; updateQueueBar(); toast("Queue cleared"); }
+};
+
+// Stop the turn running in a conversation (default: the one on screen).
+// Distinguishing a deliberate Stop from a watchdog/steer abort is what lets
+// send()'s catch block show the right outcome instead of a generic error.
+function stopGeneration(forId){
+  const id=forId||activeId, rec=inFlight.get(id);
+  if(!rec) return;
+  rec.userStopped=true;
+  fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:rec.turnKey})}).catch(()=>{});
+  rec.abort.abort();
 }
 
-async function send(autoMessage){
-  const isAuto = typeof autoMessage === "string";
-  const input=$("#input");
-  const text = isAuto ? autoMessage : input.value.trim();
-  if(!text || busy) return;
-  if(!isAuto) agentRounds=0;   // a real user message starts a fresh agent run
-  if(!activeId){ activeId=newConvoId(); try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){} messages=[]; }
-  setBusy(true);
-  currentAbort=new AbortController();
-  watchdogAborted=false; lastEventTs=Date.now();
-  if(!isAuto){ input.value=""; input.style.height="auto"; }
+// /queue <text> — line up a follow-up that fires automatically right after
+// the current turn finishes (or immediately if nothing is running).
+function queueMessage(text, forId){
+  const id=forId||activeId, rec=inFlight.get(id);
+  if(!rec){ send({text, convoId:id}); return; }
+  rec.queued = rec.queued ? rec.queued+"\n"+text : text;
+  toast("Queued — sends once the current turn finishes");
+  if(id===activeId) updateQueueBar();
+}
+
+// /steer <text> — hermes -z can't be interrupted mid-generation (it isn't
+// reading stdin while it runs), so "steering" means: stop the current step,
+// then immediately re-prompt with the new instruction PLUS whatever partial
+// output/tool trace it had produced — the closest honest equivalent of
+// redirecting a running agent within this architecture.
+function steerMessage(text, forId){
+  const id=forId||activeId, rec=inFlight.get(id);
+  if(!rec){ send({text, convoId:id}); return; }
+  rec.steering=true; rec.steerText=text;
+  toast("Steering — stopping the current step and redirecting…");
+  fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({session:rec.turnKey})}).catch(()=>{});
+  rec.abort.abort();
+}
+
+const SLASH_COMMANDS = {
+  queue: { desc:"Send this after the current turn finishes", run:(t)=>queueMessage(t) },
+  steer: { desc:"Stop the current step and redirect with new instructions", run:(t)=>steerMessage(t) },
+  stop:  { desc:"Stop the running turn", run:()=>stopGeneration(), noArg:true },
+};
+function trySlashCommand(raw){
+  const m=raw.match(/^\/(\w+)\b\s*([\s\S]*)$/);
+  if(!m) return false;
+  const cmd=SLASH_COMMANDS[m[1].toLowerCase()];
+  if(!cmd) return false;
+  const arg=m[2].trim();
+  if(!cmd.noArg && !arg){ toast(`Usage: /${m[1]} <message>`); return true; }
+  cmd.run(arg);
+  return true;
+}
+
+/* arg forms:
+   - undefined            -> read the composer box for the active conversation
+   - string                -> agent-mode auto-continue text, active conversation
+   - {text, convoId,
+      displayText, isAuto, isQueued} -> explicit send for a specific
+                                          conversation (queue/steer/auto-continue
+                                          use this so a turn always resolves
+                                          against the conversation it belongs
+                                          to, never whichever one is on screen
+                                          when the promise settles) */
+async function send(arg){
+  let sendText, displayText, forConvo, isAuto=false, isQueued=false;
+  if(typeof arg==="string"){ sendText=displayText=arg; forConvo=activeId; isAuto=true; }
+  else if(arg && typeof arg==="object"){
+    sendText=arg.text; displayText=arg.displayText ?? arg.text;
+    forConvo=arg.convoId||activeId; isAuto=!!arg.isAuto; isQueued=!!arg.isQueued;
+  } else { sendText=displayText=$("#input").value.trim(); forConvo=activeId; }
+  sendText=(sendText||"").trim();
+  if(!sendText) return;
+  if(!forConvo){ forConvo=newConvoId(); try{ activeId=forConvo; localStorage.setItem(ACTIVE_LS, forConvo); }catch(e){} messages=[]; }
+  if(isBusy(forConvo) && !isQueued){
+    if(forConvo===activeId) toast("Already running here — try /queue or /steer");
+    return;
+  }
+  if(!isAuto) agentRounds=0;   // any real/queued/steered message starts a fresh agent-mode budget
+
+  const isActive = () => activeId===forConvo;   // re-checked before every DOM write below
+
+  if(!isAuto && isActive()){ $("#input").value=""; $("#input").style.height="auto"; }
 
   // History = the conversation so far (role/text only); the backend injects it.
-  // Auto-continuations don't add a user turn — the model just keeps going from
-  // its own prior output, which is already in the history.
-  const history = messages.map(m=>({role:m.role, text:m.text}));
+  let msgs = loadMsgs(forConvo);
+  const history = msgs.map(m=>({role:m.role, text:m.text}));
 
   if(!isAuto){
-    const firstUser = !messages.some(m=>m.role==="user");
-    messages.push({role:"user", text, tools:[]});
-    const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(text);
-    touchConvo(activeId, firstUser ? text.slice(0,60) : null);
-    $("#cursession").textContent = convoTitle(activeId) || "chat";
-    saveMessages(); renderConvos();
+    const firstUser = !msgs.some(m=>m.role==="user");
+    msgs=[...msgs, {role:"user", text:displayText, tools:[]}];
+    saveMsgs(forConvo, msgs);
+    touchConvo(forConvo, firstUser ? displayText.slice(0,60) : null);
+    if(isActive()){
+      const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(displayText);
+      $("#cursession").textContent = convoTitle(forConvo) || "chat";
+    }
+    renderConvos();
   }
 
-  const aBody=addMsg("assistant"); aBody.innerHTML=`<span class="cursor"></span>`;
-  const turnKey = activeId+"__"+Date.now().toString(36);
-  lastTurnKey = turnKey;
-  // Persist the in-flight turn so a full page reload (not just a tab suspend)
-  // can still recover the reply the server finishes buffering.
-  writeJSON(PENDING_LS, {convoId: activeId, turnKey});
+  const turnKey = forConvo+"__"+Date.now().toString(36);
+  const rec = {turnKey, abort:new AbortController(), watchdogAborted:false,
+               lastEventTs:Date.now(), userStopped:false, steering:false, steerText:"", queued:null};
+  inFlight.set(forConvo, rec);
+  if(isActive()) syncComposerUI();
+  setPending(forConvo, turnKey);
+
+  let aWrap=null, aBody=null;
+  function ensureBubble(){
+    if(!isActive()) return null;
+    if(!aBody){ aBody=addMsg("assistant"); aWrap=aBody.parentElement; }
+    else if(!aWrap.isConnected){ clearEmpty(); messagesEl.append(aWrap); }
+    return aBody;
+  }
+  ensureBubble();
 
   let finalText="";           // accumulated non-tool output
   let interrupted=false, stopped=false;
   let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
   function repaint(){
+    const b=ensureBubble(); if(!b) return;   // conversation isn't on screen — storage-only for now
     let html="";
     toolLines.forEach(t=> html+=toolHtml(t));
     const shown = stripDoneToken(finalText);   // never flash [[TASK_COMPLETE]]
     html += renderMarkdown(shown);
-    if(busy && !shown) html += `<div class="status">⏺ ${esc(status)}</div>`;
-    if(busy) html += `<span class="cursor"></span>`;
-    aBody.innerHTML=html; scroll();
+    if(inFlight.has(forConvo) && !shown) html += `<div class="status">⏺ ${esc(status)}</div>`;
+    if(inFlight.has(forConvo)) html += `<span class="cursor"></span>`;
+    b.innerHTML=html; scroll();
   }
 
   // Watchdog: if no event (server pings every 15s) arrives for 45s, the
   // stream is silently dead (mobile suspends the socket without firing an
   // error). Abort it so the code falls through to server-side reattach.
   const watchdog=setInterval(()=>{
-    if(Date.now()-lastEventTs > 45000){
-      watchdogAborted=true;
-      if(currentAbort) currentAbort.abort();
-    }
+    if(Date.now()-rec.lastEventTs > 45000){ rec.watchdogAborted=true; rec.abort.abort(); }
   }, 5000);
 
   try{
     const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({message:text, session:turnKey, history, agent_mode:agentMode}), signal:currentAbort.signal});
+      body:JSON.stringify({message:sendText, session:turnKey, history, agent_mode:agentMode}), signal:rec.abort.signal});
     const reader=resp.body.getReader(); const dec=new TextDecoder();
     let buf="";
     while(true){
       const {value,done}=await reader.read(); if(done) break;
-      lastEventTs=Date.now();
+      rec.lastEventTs=Date.now();
       buf+=dec.decode(value,{stream:true});
       let idx;
       while((idx=buf.indexOf("\n\n"))>=0){
@@ -620,38 +747,57 @@ async function send(autoMessage){
       }
     }
   }catch(e){
-    if(e && e.name==="AbortError" && !watchdogAborted){
-      stopped=true; finalText += `${finalText?"\n\n":""}_⏹ stopped_`;   // deliberate Stop
+    if(e && e.name==="AbortError" && rec.watchdogAborted){
+      interrupted=true;
+      finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — reattaching to the running turn…_`;
+    } else if(e && e.name==="AbortError"){
+      // Deliberate Stop or /steer — either way the turn itself was killed.
+      stopped=true;
+      finalText += `${finalText?"\n\n":""}_⏹ stopped_`;
     } else {
-      // Stream dropped or went silent (phone locked, backgrounded, wifi blip).
-      // The turn keeps running on the server; reattach and replay from the
-      // server-side turn record.
-      interrupted=true; needsReload=true;
+      // Stream dropped without the watchdog catching it yet (e.g. immediate
+      // network failure). The turn keeps running on the server; reattach and
+      // replay from the server-side turn record.
+      interrupted=true;
       finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — reattaching to the running turn…_`;
     }
   }finally{
     clearInterval(watchdog);
-    currentAbort=null;
     const taskComplete = finalText.includes(AGENT_DONE_TOKEN);
     finalText = stripDoneToken(finalText);
-    setBusy(false); repaint(); if(!isAuto) input.focus();
-    // Persist the assistant turn into the conversation history (with a
-    // completion timestamp shown under the message).
-    messages.push({role:"assistant", text:finalText, tools:toolLines, ts:Date.now()});
-    touchConvo(activeId, null); saveMessages(); renderConvos(); updateCtxMeter();
+    inFlight.delete(forConvo);
+    if(isActive()){ syncComposerUI(); updateQueueBar(); }
+    // Persist the assistant turn (with a completion timestamp shown under
+    // the message) into the CONVERSATION'S OWN storage — never the global
+    // `messages`/`activeId`, which may now point at a different conversation
+    // if the user navigated away while this turn was running.
+    let cur = loadMsgs(forConvo);
+    cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now()}];
+    saveMsgs(forConvo, cur);
+    touchConvo(forConvo, null); renderConvos();
+    if(isActive()){ repaint(); updateCtxMeter(); if(!isAuto) $("#input").focus(); }
+
     if(interrupted){
-      recoverPending();          // start re-asking the server right away
+      recoverPending(forConvo);          // start re-asking the server right away
     } else {
-      try{ localStorage.removeItem(PENDING_LS); }catch(e){}
+      clearPending(forConvo);
       fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
-      // Agent mode: if the model didn't signal completion and it wasn't a
-      // deliberate Stop, drive the next step automatically (bounded).
-      if(agentMode && !stopped && !taskComplete && agentRounds < AGENT_MAX_ROUNDS){
+      if(rec.steering){
+        const progress = finalText ? `Partial progress/output before being interrupted: ${finalText.slice(-1500)}`
+                                    : `(no output had been produced yet before being interrupted)`;
+        send({
+          text: `[The previous attempt was stopped mid-step so the user could redirect it.] ${progress}\nNew instruction — take this into account and continue accordingly: ${rec.steerText}`,
+          displayText: `↪ Steer: ${rec.steerText}`,
+          convoId: forConvo,
+        });
+      } else if(rec.queued){
+        send({text: rec.queued, convoId: forConvo, isQueued:true});
+      } else if(agentMode && !stopped && !taskComplete && agentRounds < AGENT_MAX_ROUNDS){
         agentRounds++;
-        toast(`Agent mode — continuing (round ${agentRounds+1})…`);
-        setTimeout(()=>send(AGENT_CONTINUE_PROMPT), 250);
+        if(isActive()) toast(`Agent mode — continuing (round ${agentRounds+1})…`);
+        setTimeout(()=>send({text:AGENT_CONTINUE_PROMPT, convoId:forConvo, isAuto:true}), 250);
       } else if(agentMode && !taskComplete && agentRounds >= AGENT_MAX_ROUNDS){
-        toast(`Agent stopped after ${AGENT_MAX_ROUNDS} auto-continue rounds`);
+        if(isActive()) toast(`Agent stopped after ${AGENT_MAX_ROUNDS} auto-continue rounds`);
       }
     }
   }
@@ -691,21 +837,82 @@ $("#agentbtn").onclick=()=>{
 renderAgentBtn();
 
 /* ---------- wiring ---------- */
-$("#send").onclick=()=>{ if(busy) stopGeneration(); else send(); };
+// The composer reads its own box, decides slash-command vs. plain message,
+// and — for a plain message — always sends against the ACTIVE conversation.
+async function sendFromComposer(){
+  const raw=$("#input").value.trim();
+  if(!raw) return;
+  if(trySlashCommand(raw)){ $("#input").value=""; $("#input").style.height="auto"; return; }
+  await send();
+}
+$("#send").onclick=()=>{ if(isBusy(activeId)) stopGeneration(); else sendFromComposer(); };
 const input=$("#input");
-input.addEventListener("input",()=>{ input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,200)+"px"; });
-input.addEventListener("keydown",e=>{
-  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+input.addEventListener("input",()=>{
+  input.style.height="auto"; input.style.height=Math.min(input.scrollHeight,200)+"px";
+  updateSlashMenu(input.value);
 });
+input.addEventListener("keydown",e=>{
+  if(handleSlashMenuKey(e)) return;
+  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendFromComposer(); }
+});
+input.addEventListener("blur",()=>setTimeout(closeSlashMenu,150));   // allow a menu click to register first
 $("#newchat").onclick=()=>{ newConvo(); };
 
-/* ---------- reattach to a lost turn ----------
-   The server keeps a durable record of every turn (status + events + reply).
-   After any drop — phone lock, backgrounded browser, page reload, wifi blip —
-   we re-ask it "ну що там?" until the turn resolves. The server only reports
-   failed=true after checking its records, the live process, AND the Hermes
-   session store; only then do we show "Prompt processing failed." */
-let recoverTimer=null;
+/* ---------- slash-command autocomplete ---------- */
+let slashSel=0;
+function closeSlashMenu(){ const m=document.getElementById("slashmenu"); if(m) m.remove(); }
+function slashMatches(raw){
+  const m=raw.match(/^\/(\w*)$/);
+  if(!m) return null;
+  const q=m[1].toLowerCase();
+  return Object.entries(SLASH_COMMANDS).filter(([name])=>name.startsWith(q));
+}
+function updateSlashMenu(raw){
+  const matches=slashMatches(raw);
+  closeSlashMenu();
+  if(!matches || !matches.length) return;
+  slashSel=Math.min(slashSel, matches.length-1);
+  const menu=document.createElement("div"); menu.className="slashmenu"; menu.id="slashmenu";
+  matches.forEach(([name,cmd],i)=>{
+    const el=document.createElement("div"); el.className="item"+(i===slashSel?" sel":"");
+    el.innerHTML=`<b>/${name}</b><small>${esc(cmd.desc)}</small>`;
+    el.onmousedown=(e)=>{ e.preventDefault(); $("#input").value=`/${name} `; $("#input").focus(); closeSlashMenu(); };
+    menu.append(el);
+  });
+  $("#composer .wrap").append(menu);
+}
+function handleSlashMenuKey(e){
+  const menu=document.getElementById("slashmenu"); if(!menu) return false;
+  const matches=slashMatches($("#input").value); if(!matches||!matches.length){ closeSlashMenu(); return false; }
+  if(e.key==="ArrowDown"){ e.preventDefault(); slashSel=(slashSel+1)%matches.length; updateSlashMenu($("#input").value); return true; }
+  if(e.key==="ArrowUp"){ e.preventDefault(); slashSel=(slashSel-1+matches.length)%matches.length; updateSlashMenu($("#input").value); return true; }
+  if(e.key==="Tab" || e.key==="Enter"){
+    e.preventDefault();
+    const [name]=matches[slashSel];
+    $("#input").value=`/${name} `;
+    closeSlashMenu();
+    return true;
+  }
+  if(e.key==="Escape"){ closeSlashMenu(); return true; }
+  return false;
+}
+
+/* ---------- reattach to a lost turn (per conversation) ----------
+   The server keeps a durable record of every turn (status + events + reply),
+   keyed by turn key. PENDING_LS maps EACH conversation to its own turn key —
+   never a single global slot — so a turn started in one chat can't be
+   clobbered or lost by starting/recovering another turn in a different chat.
+   After any drop — phone lock, backgrounded browser, page reload, wifi blip,
+   opening a new tab — we re-ask "ну що там?" until each pending turn
+   resolves, and ALWAYS apply the result to the conversation the turn
+   actually belongs to (never whichever conversation happens to be on screen
+   when the response arrives). The server only reports failed=true after
+   checking its records, the live process, AND the Hermes session store. */
+const recoverTimers = new Map();   // convoId -> setTimeout handle
+
+function getPending(){ return readJSON(PENDING_LS, {}); }
+function setPending(id, turnKey){ const p=getPending(); p[id]=turnKey; writeJSON(PENDING_LS, p); }
+function clearPending(id){ const p=getPending(); delete p[id]; writeJSON(PENDING_LS, p); }
 
 function rebuildFromRecord(j){
   const tools=[]; const interims=[];
@@ -723,49 +930,57 @@ function rebuildFromRecord(j){
   return {text, tools};
 }
 
-function applyToLastAssistant(msg){
-  const last=messages[messages.length-1];
-  if(last && last.role==="assistant") messages[messages.length-1]={role:"assistant", ...msg};
-  else messages.push({role:"assistant", ...msg});
-  saveMessages(); renderConversation(); updateCtxMeter();
+// Applies a recovered result to the conversation it belongs to (`id`) via
+// storage, and only touches the live `messages`/DOM if that conversation is
+// still the one on screen — exactly like send()'s isActive() guard, for the
+// same reason: `id` was fixed when recovery started, `activeId` may have
+// changed by the time this resolves.
+function applyToConvo(id, msg){
+  let arr = loadMsgs(id);
+  const last = arr[arr.length-1];
+  if(last && last.role==="assistant") arr=[...arr.slice(0,-1), {role:"assistant", ts:Date.now(), ...msg}];
+  else arr=[...arr, {role:"assistant", ts:Date.now(), ...msg}];
+  saveMsgs(id, arr);
+  if(id===activeId){ renderConversation(); updateCtxMeter(); }
+  renderConvos();
 }
 
-function settlePending(turnKey){
-  needsReload=false;
-  if(recoverTimer){ clearTimeout(recoverTimer); recoverTimer=null; }
-  try{ localStorage.removeItem(PENDING_LS); }catch(e){}
-  fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
-}
-
-async function recoverPending(){
-  if(busy) return;
-  const pending = readJSON(PENDING_LS, null);
-  if(!pending || pending.convoId!==activeId || !pending.turnKey) return;
-  lastTurnKey = pending.turnKey;
+async function recoverPending(forId){
+  const id = forId || activeId;
+  if(!id || inFlight.has(id)) return;   // a live send() in this tab already owns this turn
+  const turnKey = getPending()[id];
+  if(!turnKey) return;
   try{
-    const r=await fetch("/api/turn/"+encodeURIComponent(pending.turnKey));
+    const r=await fetch("/api/turn/"+encodeURIComponent(turnKey));
     const j=await r.json();
+    if(inFlight.has(id)) return;   // a live send() started for this convo while we were awaiting
     if(j.done){
-      applyToLastAssistant(rebuildFromRecord(j));
-      settlePending(pending.turnKey);
+      applyToConvo(id, rebuildFromRecord(j));
+      clearPending(id);
+      fetch("/api/turn/"+encodeURIComponent(turnKey)+"/ack",{method:"POST"}).catch(()=>{});
+      const t=recoverTimers.get(id); if(t){ clearTimeout(t); recoverTimers.delete(id); }
     } else if(j.running){
       // Show sub-steps completed so far + the real current condition (which
       // tool / generating), with elapsed time — not just "still generating".
       const partial=rebuildFromRecord(j);
       const elapsed = j.started ? ` · ${fmtElapsed(Date.now()/1000 - j.started)}` : "";
       partial.text += (partial.text?"\n\n":"") + `_⏳ ${j.label || "Working…"}${elapsed} (running on the server)_`;
-      applyToLastAssistant(partial);
-      if(recoverTimer) clearTimeout(recoverTimer);
-      recoverTimer=setTimeout(recoverPending, 4000);
+      applyToConvo(id, partial);
+      const t=setTimeout(()=>recoverPending(id), 4000);
+      recoverTimers.set(id, t);
     } else if(j.failed){
-      applyToLastAssistant({text:"_❌ Prompt processing failed._", tools:[]});
-      settlePending(pending.turnKey);
+      applyToConvo(id, {text:"_❌ Prompt processing failed._", tools:[]});
+      clearPending(id);
     }
-  }catch(e){ if(recoverTimer) clearTimeout(recoverTimer); recoverTimer=setTimeout(recoverPending, 5000); }
+  }catch(e){
+    const t=setTimeout(()=>recoverPending(id), 5000);
+    recoverTimers.set(id, t);
+  }
 }
-document.addEventListener("visibilitychange",()=>{ if(!document.hidden) recoverPending(); });
-window.addEventListener("focus", recoverPending);
-window.addEventListener("pageshow", recoverPending);
+function recoverAllPending(){ Object.keys(getPending()).forEach(id=>recoverPending(id)); }
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) recoverAllPending(); });
+window.addEventListener("focus", recoverAllPending);
+window.addEventListener("pageshow", recoverAllPending);
 
 // Startup: restore the active conversation (or the most recent) from storage.
 (function boot(){
@@ -773,10 +988,10 @@ window.addEventListener("pageshow", recoverPending);
     activeId = convos.length ? convos[0].id : newConvoId();
   }
   try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){}
-  messages = readJSON(msgsKey(activeId), []);
+  messages = loadMsgs(activeId);
   $("#cursession").textContent = convoTitle(activeId) || "New chat";
-  renderConvos(); renderConversation(); health(); fetchContext(); input.focus();
-  recoverPending();   // pick up a reply interrupted before this load
+  renderConvos(); renderConversation(); health(); fetchContext(); syncComposerUI(); updateQueueBar(); input.focus();
+  recoverAllPending();   // pick up every conversation's reply interrupted before this load
 })();
 setInterval(health,15000);
 setInterval(fetchContext,300000);   // refresh the fixed prompt budget every 5 min
