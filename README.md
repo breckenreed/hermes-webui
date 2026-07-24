@@ -19,6 +19,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🧵➕🧵 **True multi-conversation concurrency** — every turn is tracked per conversation, not globally. Switch chats freely while a turn is running elsewhere; each one keeps streaming, recovering, and saving to *its own* history. (Earlier versions used a single global "busy"/message-list, so a turn that outlived a conversation switch — new tab, reload + immediate switch — could apply its reply to whatever chat was on screen when it finished. Fixed.)
 - ⌨️ **Slash commands** — `/queue <text>` lines up a follow-up that sends automatically the moment the current turn finishes; `/steer <text>` stops the current step and immediately redirects the agent with a new instruction (plus whatever partial output it had produced) instead of waiting for it to finish; `/stop` stops the running turn. Autocompletes as you type `/`.
 - 🌐 **Online model picker** — a composer button lists every entry in Hermes' `fallback_providers` config (Gemini, or anything else you've configured) as an on-demand choice, not just an automatic failover. Pick one and the next message routes through it (`-m <model> --provider <provider>` for that turn only — no config change, no restart); pick "🖥 Local" to go back. See [Online models](#online-models) below.
+- ⚡ **"Use best available" + automatic rate-limit rerouting** — one click starts a turn at the top of your `fallback_providers` hierarchy and lets Hermes' own retry loop cascade through the rest of the chain in-process if a model hits a rate limit, so a single turn can survive several models' quotas being exhausted without you doing anything. Because that switch is otherwise silent (Hermes only prints it to a live console, never to the transcript), the webui detects it by diffing the session's final model against what was requested and shows a persistent, timestamped notice — `⚠️ gemini-3.6-flash was rate-limited — continued on gemini-3-flash-preview` — plus a toast at the moment it happens.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -129,32 +130,52 @@ Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
 ### Online models
 
 `fallback_providers` in `~/.hermes/config.yaml` is normally an **automatic**
-failover chain — Hermes only tries an entry when the primary model errors
+failover chain — Hermes only tries an entry when the current model errors
 with a rate-limit/5xx/connection failure. The webui's 🌐 model picker
 repurposes the same list as an **on-demand menu**: pick an entry and your next
 message routes through it directly (`-m <model> --provider <provider>` for
 that turn only), instead of waiting for the local model to fail first.
 
-Add an entry to enable it:
+List **more than one** entry and it becomes a real hierarchy, not just a
+single alternate — free-tier daily quotas (RPD) are often small (e.g. 20
+requests/day per model on a fresh Google AI Studio project) and get exhausted
+fast, so spreading turns across several models multiplies your effective
+daily budget:
 
 ```yaml
 fallback_providers:
-  - provider: gemini          # Hermes' internal provider id — NOT the display
-                               # name shown in `hermes model`'s picker ("Google
-                               # AI Studio"). Run `hermes fallback add` once to
-                               # see the id it writes, or check hermes_cli/auth.py.
-    model: gemini-3.6-flash   # the model field is named "model" here, not
-                               # "default" (that's only the top-level `model:`
-                               # block's key) — get_fallback_chain() silently
-                               # drops any entry missing "provider" or "model".
+  - provider: gemini
+    model: gemini-3.6-flash        # best/newest first
     api_key: ${GEMINI_CLIENT_UID}
-    context_length: 1000000
+    context_length: 250000         # match your plan's real TPM ceiling, not
+    max_tokens: 16384               # the model's theoretical max context —
+                                     # check your usage dashboard for the
+                                     # actual figure (Google AI Studio: TPM
+                                     # column). A window bigger than what your
+                                     # plan allows just means the meter/budget
+                                     # lies about how much room is left.
+  - provider: gemini
+    model: gemini-3.5-flash
+    api_key: ${GEMINI_CLIENT_UID}
+    context_length: 250000
     max_tokens: 16384
+  - provider: gemini
+    model: gemini-3.1-flash-lite   # a "lite" sibling often has a MUCH higher
+    api_key: ${GEMINI_CLIENT_UID}  # daily quota (500 vs 20 RPD, on the same
+    context_length: 250000         # account) — put one or two near the end
+    max_tokens: 16384               # of the chain as a high-headroom safety net.
 ```
 
 Run `hermes fallback list` inside the container to confirm Hermes actually
-parsed the entry — a config with the wrong keys loads with **no error and no
-entries**, which looks identical to "not configured".
+parsed every entry — a config with the wrong keys loads with **no error and
+no entries**, which looks identical to "not configured". `provider:` must be
+Hermes' internal id (e.g. `gemini`), not the display name shown in `hermes
+model`'s picker ("Google AI Studio"); each entry needs its own `model:` key
+(not `default:`, which is only the top-level `model:` block's key) — an entry
+missing either is silently dropped by `get_fallback_chain()`. Not every model
+name your plan's dashboard lists is actually callable — an older generation
+can 404 as "no longer available to new users" even while its quota still
+shows on the page; verify each entry with a direct call before relying on it.
 
 The provider's own credential env var must reach the **hermes-agent**
 container directly (e.g. `GEMINI_API_KEY` for the built-in `gemini` provider —
@@ -172,6 +193,36 @@ provider-key names like `GOOGLE_API_KEY` from reaching the sandboxed
 guardrail never touches the main Hermes process's own environment, which is
 what resolves provider auth for both the fallback chain and the picker.
 
+#### "Use best available" — automatic mid-turn rerouting
+
+Picking **⚡ Use best available** in the model picker starts the turn at
+entry #1 of your `fallback_providers` chain. If that model rate-limits (or
+hits a billing/connection error), you do **not** need to resend anything:
+Hermes' own retry loop (`agent.chat_completion_helpers.try_activate_
+fallback`) swaps the model in-process and keeps generating the *same* reply —
+verified end-to-end with a saturated top-of-chain model, where a single turn
+transparently walked `gemini-3.6-flash → gemini-3.5-flash → gemini-3-flash-
+preview` and still returned the correct answer.
+
+That switch is otherwise **silent** — Hermes prints it only to a live
+console (`⚠️ Rate limited — switching to fallback provider...`), never into
+the session transcript. The webui detects it itself, by diffing the turn's
+final model (from `hermes sessions export`) against what was requested, and
+renders a persistent, timestamped notice in the reply:
+
+> ⚠️ gemini-3.6-flash was rate-limited — continued on gemini-3-flash-preview
+
+plus a toast at the moment it happens. Picking a *specific* model from the
+list (instead of "best available") behaves the same way if THAT model itself
+has further entries below it in the chain — "best available" is just a
+convenience that always points at whichever entry is currently #1, so it
+keeps working if you reorder the list later.
+
+`agent.api_max_retries` (config.yaml, default 3) controls how many times
+Hermes retries the *current* model before giving up and advancing to the
+next one — lower it if you'd rather move through the chain faster than wait
+out repeated backoff on a model that's clearly exhausted for the day.
+
 ### Docker socket path
 
 `docker-compose.yml` mounts `//var/run/docker.sock:/var/run/docker.sock`, which
@@ -185,12 +236,12 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET`  | `/api/health` | Is the Hermes container reachable? |
-| `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}],"model","provider"}` — `session` is a unique per-turn key; `history` is the prior conversation; `model`/`provider` (optional) override Hermes' default for this turn only |
+| `POST` | `/api/chat` | Send a turn; streams the reply as SSE (`chunk`/`tool`/`model_switch`/`error`/`ping`/`done`). Body: `{"message","session","history":[{"role","text"}],"model","provider"}` — `session` is a unique per-turn key; `history` is the prior conversation; `model`/`provider` (optional) override Hermes' default for this turn only. A `model_switch` event (`{from,to,ts}`) fires if Hermes' own fallback chain swapped models mid-turn |
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
 | `GET`  | `/api/turn/{session}` | Reattach point for a lost turn: `{status: running\|done\|failed, events, text}`. While running, returns completed sub-steps (tool calls/results, interim messages) live; reports `failed` only after checking the record, the live process, and the Hermes session store |
 | `POST` | `/api/turn/{session}/ack` | Confirm receipt of a turn's outcome; the server then drops its record. Until acked, reconnects can replay it |
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
-| `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain. Cached 5 min |
+| `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider,context_length,max_tokens}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain in order. Cached 5 min |
 
 ## Security notes
 

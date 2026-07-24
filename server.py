@@ -431,8 +431,9 @@ async def _latest_cli_session_id() -> str:
         return ""
 
 
-async def _export_turn(sid: str) -> tuple[list[dict], str]:
-    """Ordered activity of one Hermes session + its final reply text.
+async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
+    """Ordered activity of one Hermes session + its final reply text + the
+    model that ended up serving it.
 
     Events mirror the agent's actions into the chat, Claude-code style:
       call    — a tool invocation (name + args)
@@ -440,6 +441,14 @@ async def _export_turn(sid: str) -> tuple[list[dict], str]:
       interim — an intermediate assistant message (a finished sub-step),
                 emitted only for messages that are NOT the last one, so the
                 final reply (which arrives via stdout) is never duplicated.
+
+    The returned model is the session's ACTUAL final model — if Hermes'
+    built-in fallback chain (agent.chat_completion_helpers.try_activate_
+    fallback) switched away from whatever was requested mid-turn (rate
+    limit / billing / connection failure on the requested model), this is
+    how the caller finds out, since that switch is otherwise silent: it's
+    only a live-console status line, never written into the transcript.
+
     Read-only, so polling it mid-turn is safe.
     """
     try:
@@ -449,7 +458,8 @@ async def _export_turn(sid: str) -> tuple[list[dict], str]:
         out = out.strip()
         obj = json.loads(out[out.index("{"):].splitlines()[0])
     except Exception:  # noqa: BLE001
-        return [], ""
+        return [], "", ""
+    final_model = str(obj.get("model") or "")
     msgs = obj.get("messages", [])
     events: list[dict] = []
     final_text = ""
@@ -477,7 +487,7 @@ async def _export_turn(sid: str) -> tuple[list[dict], str]:
         elif role == "tool":
             events.append({"kind": "result",
                            "text": content.replace("\n", " ")[:300]})
-    return events, final_text
+    return events, final_text, final_model
 
 
 async def _stream_chat(history: list[dict], message: str, session: str,
@@ -503,10 +513,9 @@ async def _stream_chat(history: list[dict], message: str, session: str,
         "--resume", session,
         "--yolo", "--cli",
     ]
-    if model:
-        args += ["-m", model]
-    elif DEFAULT_MODEL:
-        args += ["-m", DEFAULT_MODEL]
+    requested_model = model or DEFAULT_MODEL   # for mid-turn switch detection below
+    if requested_model:
+        args += ["-m", requested_model]
     if provider:
         args += ["--provider", provider]
 
@@ -559,13 +568,26 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 if nid and nid != pre_id:
                     rec["turn_id"] = nid
             if rec["turn_id"]:
-                events, final_text = await _export_turn(rec["turn_id"])
+                events, final_text, final_model = await _export_turn(rec["turn_id"])
                 known = sum(1 for e in rec["events"] if e.get("kind") != "chunk")
                 for ev in events[known:]:
                     ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
                 if not rec["text"] and final_text:
                     rec["text"] = final_text
+                # Hermes' own fallback chain (try_activate_fallback) swaps
+                # models mid-turn on rate-limit/billing/connection failure
+                # SILENTLY — the "⚠️ Rate limited — switching..." line is a
+                # live-console status only, never written to the session. The
+                # session's final `model` field is the only durable signal a
+                # switch happened, so diff it against what we asked for and
+                # surface it as its own event the client renders as a notice.
+                if requested_model and final_model:
+                    req = requested_model.strip().lower()
+                    fin = final_model.strip().lower()
+                    if req and fin and req != fin:
+                        switch_ev = record("model_switch", {"from": requested_model, "to": final_model})
+                        await q.put(("model_switch", switch_ev))
         except Exception:  # noqa: BLE001
             pass
         _persist_turn(session, rec)
@@ -612,7 +634,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                         continue
                     rec["turn_id"] = nid
                     _persist_turn(session, rec)
-                events, _ = await _export_turn(rec["turn_id"])
+                events, _, _ = await _export_turn(rec["turn_id"])
                 for ev in events[sent:]:
                     ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
@@ -629,7 +651,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
     tasks["poller"] = poller
     try:
         rc = 0
-        streamed_tools = 0
+        streamed_nonchunk = 0
         while True:
             try:
                 kind, data = await asyncio.wait_for(q.get(), timeout=15)
@@ -643,15 +665,18 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             if kind == "eof":
                 rc = data.get("code", 0)
                 break
-            if kind == "tool":
-                streamed_tools += 1
+            if kind in ("tool", "model_switch"):
+                streamed_nonchunk += 1
             yield sse(kind, data)
         poller.cancel()
-        # Replay tool/interim events finish_record added after the live
-        # stream ended (turns faster than the poll interval).
+        # Replay events finish_record added after the live stream ended
+        # (turns faster than the poll interval), each under its own SSE event
+        # name — call/result/interim ride the "tool" event per the existing
+        # frontend contract; model_switch (and anything else) uses its own kind.
         non_chunk = [e for e in rec["events"] if e.get("kind") != "chunk"]
-        for ev in non_chunk[streamed_tools:]:
-            yield sse("tool", ev)
+        for ev in non_chunk[streamed_nonchunk:]:
+            sse_name = "tool" if ev.get("kind") in ("call", "result", "interim") else ev.get("kind", "tool")
+            yield sse(sse_name, ev)
         yield sse("done", {"code": rc, "stopped": False})
     except asyncio.CancelledError:
         # Client dropped (phone locked / backgrounded / wifi blip). Do NOT
@@ -808,6 +833,8 @@ def _status_label(events: list[dict]) -> str:
             return "Processing tool result"
         if k == "interim":
             return "Working…"
+        if k == "model_switch":
+            return f"Switched to {e.get('to', '?')} (rate limited) — continuing…"
         if k == "chunk":
             return "Generating response…"
     return "Processing prompt…"
@@ -849,7 +876,7 @@ async def turn(session: str):
                     _persist_turn(session, rec)
             if rec.get("turn_id"):
                 try:
-                    events, _ = await _export_turn(rec["turn_id"])
+                    events, _, _ = await _export_turn(rec["turn_id"])
                 except Exception:  # noqa: BLE001
                     events = []
             if not events:
@@ -863,7 +890,7 @@ async def turn(session: str):
     # Process gone with no finished record — last resort: ask the Hermes
     # store whether this turn's session holds a completed reply.
     if rec and rec.get("turn_id"):
-        events, final_text = await _export_turn(rec["turn_id"])
+        events, final_text, _ = await _export_turn(rec["turn_id"])
         if final_text or events:
             rec.update(status="done", text=final_text or rec.get("text", ""),
                        events=events, code=rec.get("code") or 0)
