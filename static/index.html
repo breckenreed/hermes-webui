@@ -323,12 +323,17 @@ function updateCtxMeter(){
   const el=$("#ctxmeter"); if(!el || !ctxInfo) return;
   const conv = messages.reduce((a,m)=>a+estTokens(m.text)+4, 0);
   const used = (ctxInfo.base_tokens||0) + conv;
-  const max = ctxInfo.context_length||0;
+  // An online model's context window (e.g. Gemini's 1M) is unrelated to the
+  // local primary's — size the denominator (and label) to whichever model
+  // is actually selected, not always the primary from /api/context.
+  const online = selectedModel && selectedModel.context_length;
+  const max = online ? selectedModel.context_length : (ctxInfo.context_length||0);
+  const modelLabel = selectedModel ? `${selectedModel.model} (online, via ${selectedModel.provider})` : (ctxInfo.model||"?");
   const pct = max ? Math.round(used/max*100) : 0;
   el.textContent = max ? `~${fmtK(used)} / ${fmtK(max)} (${pct}%)` : `~${fmtK(used)}`;
   el.classList.toggle("warn", pct>=70 && pct<90);
   el.classList.toggle("danger", pct>=90);
-  el.title = `model: ${ctxInfo.model||"?"}\nfixed prompt budget (system+skills+tools): ~${fmtK(ctxInfo.base_tokens||0)} tokens\nconversation history: ~${fmtK(conv)} tokens\ntoken counts are estimates (~4 chars/token)`;
+  el.title = `model: ${modelLabel}\nfixed prompt budget (system+skills+tools): ~${fmtK(ctxInfo.base_tokens||0)} tokens\nconversation history: ~${fmtK(conv)} tokens\ntoken counts are estimates (~4 chars/token)`;
 }
 async function fetchContext(){
   try{ const r=await fetch("/api/context"); ctxInfo=await r.json(); updateCtxMeter(); }
@@ -867,7 +872,15 @@ async function fetchModels(){
   try{
     const r=await fetch("/api/models"); const j=await r.json();
     modelOptions = j.options||[];
+    // Refresh a persisted selection against the latest config — covers a
+    // selection saved before context_length/max_tokens were tracked, and a
+    // config.yaml edit to an already-selected model's window.
+    if(selectedModel){
+      const match=modelOptions.find(o=>o.model===selectedModel.model && o.provider===selectedModel.provider);
+      if(match) selectedModel=match;
+    }
     renderModelBtn();
+    updateCtxMeter();
   }catch(e){ /* backend offline */ }
 }
 function renderModelBtn(){
@@ -889,6 +902,7 @@ function pickModel(opt){
     else localStorage.removeItem(MODEL_LS);
   }catch(e){}
   renderModelBtn();
+  updateCtxMeter();   // the context window denominator depends on which model is active
   closeModelMenu();
   toast(opt ? `Next message routes to ${opt.model} (${opt.provider})` : "Back to the local model");
 }
