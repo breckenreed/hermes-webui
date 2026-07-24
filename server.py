@@ -760,7 +760,22 @@ async def models_info():
             # Mirrors Hermes' own get_fallback_chain(): an entry missing
             # either key is invalid and never gets tried, so don't offer it.
             if model_id and provider_id:
-                options.append({"model": model_id, "provider": provider_id})
+                # context_length/max_tokens ride along so the webui's context
+                # meter can size its denominator to whichever model is
+                # actually selected — an online model's window (e.g. Gemini's
+                # 1M) has nothing to do with the local primary's.
+                try:
+                    ctx_len = int(e.get("context_length") or 0)
+                except (TypeError, ValueError):
+                    ctx_len = 0
+                try:
+                    max_tok = int(e.get("max_tokens") or 0)
+                except (TypeError, ValueError):
+                    max_tok = 0
+                options.append({
+                    "model": model_id, "provider": provider_id,
+                    "context_length": ctx_len, "max_tokens": max_tok,
+                })
     except Exception:  # noqa: BLE001
         pass
 
