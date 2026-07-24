@@ -26,6 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
+import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -122,6 +123,8 @@ class ChatBody(BaseModel):
     session: str                      # unique per-turn key (isolation + stop handle)
     history: list[dict] = []          # prior [{role, text}] turns, injected as context
     agent_mode: bool = False          # add completion pressure for multi-step / todo work
+    model: str = ""                   # per-turn model override (blank = Hermes' configured default)
+    provider: str = ""                # per-turn provider override, paired with `model`
 
 
 @app.get("/")
@@ -478,12 +481,18 @@ async def _export_turn(sid: str) -> tuple[list[dict], str]:
 
 
 async def _stream_chat(history: list[dict], message: str, session: str,
-                       agent_mode: bool = False):
+                       agent_mode: bool = False, model: str = "", provider: str = ""):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives.
 
     `session` is a unique per-turn key: it isolates this turn's Hermes session
     (a fresh name starts clean) and is the handle /api/stop uses to kill it.
     Context comes from the injected history, not from Hermes' session store.
+
+    `model`/`provider` override Hermes' configured default for THIS turn only
+    (plain `-m`/`--provider` CLI flags — no config.yaml change, no restart).
+    This is how the webui's online-model picker routes a turn to Gemini (or
+    any other `fallback_providers` entry) on demand, rather than only via
+    Hermes' automatic failover-on-error path.
 
     While the turn runs, a poller watches the forked Hermes session and emits
     `tool` events (calls + results) so the UI can show the agent's actions
@@ -494,8 +503,12 @@ async def _stream_chat(history: list[dict], message: str, session: str,
         "--resume", session,
         "--yolo", "--cli",
     ]
-    if DEFAULT_MODEL:
+    if model:
+        args += ["-m", model]
+    elif DEFAULT_MODEL:
         args += ["-m", DEFAULT_MODEL]
+    if provider:
+        args += ["--provider", provider]
 
     def sse(event: str, data: dict) -> bytes:
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
@@ -705,6 +718,57 @@ async def context_info():
     return data
 
 
+# Model list is cheap (one `cat`, no hermes invocation) but still worth caching
+# briefly — the composer's model picker fetches it on every conversation open.
+MODELS_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+@app.get("/api/models")
+async def models_info():
+    """Selectable models for the composer's model picker: Hermes' configured
+    primary (local) model, plus every entry in `fallback_providers`.
+
+    fallback_providers is normally an AUTOMATIC failover chain (tried only
+    when the primary errors with a rate-limit/5xx/connection failure) — this
+    endpoint repurposes the same config block as a menu of on-demand options,
+    so picking one and sending a turn routes THAT turn's `hermes -z` call
+    through `-m <model> --provider <provider>` instead of waiting for the
+    primary to fail first. Cached 5 minutes.
+    """
+    import time
+
+    now = time.time()
+    if MODELS_CACHE["data"] and now - MODELS_CACHE["ts"] < 300:
+        return MODELS_CACHE["data"]
+
+    primary = {"model": "", "provider": ""}
+    options: list[dict] = []
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "cat", "/opt/data/config.yaml"), timeout=15)
+        cfg = yaml.safe_load(out) or {}
+        m = cfg.get("model") or {}
+        primary = {"model": str(m.get("default") or ""), "provider": str(m.get("provider") or "")}
+
+        raw = cfg.get("fallback_providers")
+        entries = raw if isinstance(raw, list) else ([raw] if isinstance(raw, dict) else [])
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            model_id = str(e.get("model") or "").strip()
+            provider_id = str(e.get("provider") or "").strip()
+            # Mirrors Hermes' own get_fallback_chain(): an entry missing
+            # either key is invalid and never gets tried, so don't offer it.
+            if model_id and provider_id:
+                options.append({"model": model_id, "provider": provider_id})
+    except Exception:  # noqa: BLE001
+        pass
+
+    data = {"primary": primary, "options": options}
+    MODELS_CACHE.update(ts=now, data=data)
+    return data
+
+
 async def _turn_alive_in_container(session: str) -> bool:
     """Is the hermes process for this turn still running inside the container?
     Covers the case where the webui restarted mid-turn and lost its handle."""
@@ -815,7 +879,8 @@ async def chat(body: ChatBody):
         return JSONResponse({"error": "empty message"}, status_code=400)
     session = body.session.strip() or "webui_default"
     return StreamingResponse(
-        _stream_chat(body.history or [], msg, session, body.agent_mode),
+        _stream_chat(body.history or [], msg, session, body.agent_mode,
+                     body.model.strip(), body.provider.strip()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
