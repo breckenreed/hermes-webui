@@ -18,6 +18,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🔌 **Disconnect-proof turns** — every turn is recorded server-side (memory + disk). A mobile client that locks, backgrounds, or loses wifi mid-turn reattaches on return: it sees the sub-steps completed so far while the turn is still running, gets the full reply when it finishes, and sees *"Prompt processing failed"* only after the server has checked its records, the live process, and the Hermes session store.
 - 🧵➕🧵 **True multi-conversation concurrency** — every turn is tracked per conversation, not globally. Switch chats freely while a turn is running elsewhere; each one keeps streaming, recovering, and saving to *its own* history. (Earlier versions used a single global "busy"/message-list, so a turn that outlived a conversation switch — new tab, reload + immediate switch — could apply its reply to whatever chat was on screen when it finished. Fixed.)
 - ⌨️ **Slash commands** — `/queue <text>` lines up a follow-up that sends automatically the moment the current turn finishes; `/steer <text>` stops the current step and immediately redirects the agent with a new instruction (plus whatever partial output it had produced) instead of waiting for it to finish; `/stop` stops the running turn. Autocompletes as you type `/`.
+- 🌐 **Online model picker** — a composer button lists every entry in Hermes' `fallback_providers` config (Gemini, or anything else you've configured) as an on-demand choice, not just an automatic failover. Pick one and the next message routes through it (`-m <model> --provider <provider>` for that turn only — no config change, no restart); pick "🖥 Local" to go back. See [Online models](#online-models) below.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
@@ -125,6 +126,52 @@ at a different vault path), or set it empty to turn it off.
 
 Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
 
+### Online models
+
+`fallback_providers` in `~/.hermes/config.yaml` is normally an **automatic**
+failover chain — Hermes only tries an entry when the primary model errors
+with a rate-limit/5xx/connection failure. The webui's 🌐 model picker
+repurposes the same list as an **on-demand menu**: pick an entry and your next
+message routes through it directly (`-m <model> --provider <provider>` for
+that turn only), instead of waiting for the local model to fail first.
+
+Add an entry to enable it:
+
+```yaml
+fallback_providers:
+  - provider: gemini          # Hermes' internal provider id — NOT the display
+                               # name shown in `hermes model`'s picker ("Google
+                               # AI Studio"). Run `hermes fallback add` once to
+                               # see the id it writes, or check hermes_cli/auth.py.
+    model: gemini-3.5-flash   # the model field is named "model" here, not
+                               # "default" (that's only the top-level `model:`
+                               # block's key) — get_fallback_chain() silently
+                               # drops any entry missing "provider" or "model".
+    api_key: ${GEMINI_CLIENT_UID}
+    context_length: 1000000
+    max_tokens: 16384
+```
+
+Run `hermes fallback list` inside the container to confirm Hermes actually
+parsed the entry — a config with the wrong keys loads with **no error and no
+entries**, which looks identical to "not configured".
+
+The provider's own credential env var must reach the **hermes-agent**
+container directly (e.g. `GEMINI_API_KEY` for the built-in `gemini` provider —
+set it in `hermes-docker`'s `.env`/`environment:`, not this repo's `.env`).
+An explicit `api_key:` in the fallback entry (as above) works too, but only
+for Hermes' *automatic* failover path — the webui's ad-hoc `-m`/`--provider`
+override reads the provider's native env var (`GOOGLE_API_KEY`/
+`GEMINI_API_KEY` for `gemini`), not the fallback entry's `api_key:` field, so
+set both if you want the picker and automatic failover to both work.
+
+Setting that provider credential is unrelated to `terminal.env_passthrough` /
+Hermes' sandbox credential-scrubbing guardrail (which blocks well-known
+provider-key names like `GOOGLE_API_KEY` from reaching the sandboxed
+`execute_code`/`terminal` child process only, per GHSA-rhgp-j443-p4rf) — that
+guardrail never touches the main Hermes process's own environment, which is
+what resolves provider auth for both the fallback chain and the picker.
+
 ### Docker socket path
 
 `docker-compose.yml` mounts `//var/run/docker.sock:/var/run/docker.sock`, which
@@ -138,11 +185,12 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | Method | Path | Purpose |
 |---|---|---|
 | `GET`  | `/api/health` | Is the Hermes container reachable? |
-| `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}]}` — `session` is a unique per-turn key; `history` is the prior conversation |
+| `POST` | `/api/chat` | Send a turn; streams the reply as SSE. Body: `{"message","session","history":[{"role","text"}],"model","provider"}` — `session` is a unique per-turn key; `history` is the prior conversation; `model`/`provider` (optional) override Hermes' default for this turn only |
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
 | `GET`  | `/api/turn/{session}` | Reattach point for a lost turn: `{status: running\|done\|failed, events, text}`. While running, returns completed sub-steps (tool calls/results, interim messages) live; reports `failed` only after checking the record, the live process, and the Hermes session store |
 | `POST` | `/api/turn/{session}/ack` | Confirm receipt of a turn's outcome; the server then drops its record. Until acked, reconnects can replay it |
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
+| `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain. Cached 5 min |
 
 ## Security notes
 
