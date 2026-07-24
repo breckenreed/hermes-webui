@@ -143,7 +143,7 @@ fallback_providers:
                                # name shown in `hermes model`'s picker ("Google
                                # AI Studio"). Run `hermes fallback add` once to
                                # see the id it writes, or check hermes_cli/auth.py.
-    model: gemini-3.5-flash   # the model field is named "model" here, not
+    model: gemini-3.6-flash   # the model field is named "model" here, not
                                # "default" (that's only the top-level `model:`
                                # block's key) — get_fallback_chain() silently
                                # drops any entry missing "provider" or "model".
