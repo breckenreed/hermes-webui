@@ -93,6 +93,7 @@
   #ctxmeter.danger{color:var(--red)}
   .tool.call{border-left-color:var(--accent);color:var(--accent2)}
   .tool.result{border-left-color:#3d4753;color:var(--muted)}
+  .tool.switch{border-left-color:#f0b429;color:#f0b429;font-weight:600}
   .tool .ts{color:#5a6570}
   .msgtime{color:#5a6570;font-family:var(--mono);font-size:10.5px;margin-top:6px}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
@@ -328,7 +329,10 @@ function updateCtxMeter(){
   // is actually selected, not always the primary from /api/context.
   const online = selectedModel && selectedModel.context_length;
   const max = online ? selectedModel.context_length : (ctxInfo.context_length||0);
-  const modelLabel = selectedModel ? `${selectedModel.model} (online, via ${selectedModel.provider})` : (ctxInfo.model||"?");
+  const modelLabel = selectedModel
+    ? (selectedModel.best ? `Best available (currently ${selectedModel.model}, via ${selectedModel.provider})`
+                          : `${selectedModel.model} (online, via ${selectedModel.provider})`)
+    : (ctxInfo.model||"?");
   const pct = max ? Math.round(used/max*100) : 0;
   el.textContent = max ? `~${fmtK(used)} / ${fmtK(max)} (${pct}%)` : `~${fmtK(used)}`;
   el.classList.toggle("warn", pct>=70 && pct<90);
@@ -503,8 +507,12 @@ function toolHtml(t){
   const m = t.match(/^(\d{2}:\d{2}:\d{2})\s+([\s\S]*)$/);
   const time = m ? m[1] : "";
   const body = m ? m[2] : t;
-  const cls = body.startsWith("●") ? "tool call" : (body.startsWith("↳") ? "tool result" : "tool");
+  const cls = body.startsWith("●") ? "tool call" : body.startsWith("↳") ? "tool result"
+    : body.startsWith("⚠️") ? "tool switch" : "tool";
   return `<div class="${cls}">${time?`<span class="ts">${time}</span> `:""}${esc(body)}</div>`;
+}
+function switchLine(from, to, ts){
+  return `${fmtClock(ts)}  ⚠️ ${from} was rate-limited — continued on ${to}`;
 }
 
 /* render a full transcript message (with optional tool lines + a time footer) */
@@ -763,6 +771,15 @@ async function send(arg){
             status="Generating…";
           }
           repaint();
+        } else if(ev.event==="model_switch"){
+          // Hermes' own fallback chain swapped models mid-turn (rate limit /
+          // billing / connection failure) and kept generating — surface it
+          // so the user knows the reply didn't come from the model they picked.
+          const d=ev.data||{};
+          toolLines.push(switchLine(d.from, d.to, d.ts));
+          status=`Switched to ${d.to} — continuing…`;
+          toast(`⚠️ ${d.from} rate-limited — switched to ${d.to}`);
+          repaint();
         } else if(ev.event==="error"){
           finalText += `\n\n_error: ${ev.data.message}_`; repaint();
         }
@@ -872,10 +889,16 @@ async function fetchModels(){
   try{
     const r=await fetch("/api/models"); const j=await r.json();
     modelOptions = j.options||[];
-    // Refresh a persisted selection against the latest config — covers a
-    // selection saved before context_length/max_tokens were tracked, and a
-    // config.yaml edit to an already-selected model's window.
-    if(selectedModel){
+    if(selectedModel && selectedModel.best){
+      // "Best available" always points at whatever is CURRENTLY #1 in the
+      // chain — re-derive it fresh rather than matching by identity, since
+      // the whole point is that it's allowed to move.
+      if(modelOptions.length) selectedModel={...modelOptions[0], best:true};
+      else selectedModel=null;   // chain emptied out from under it
+    } else if(selectedModel){
+      // Refresh a fixed pick against the latest config — covers a selection
+      // saved before context_length/max_tokens were tracked, and a
+      // config.yaml edit to an already-selected model's window.
       const match=modelOptions.find(o=>o.model===selectedModel.model && o.provider===selectedModel.provider);
       if(match) selectedModel=match;
     }
@@ -885,7 +908,11 @@ async function fetchModels(){
 }
 function renderModelBtn(){
   const btn=$("#modelbtn");
-  if(selectedModel){
+  if(selectedModel && selectedModel.best){
+    btn.textContent = "⚡ Best available";
+    btn.title = `Auto-reroutes on rate limit through the fallback_providers chain — currently starts at ${selectedModel.model} (${selectedModel.provider})`;
+    btn.classList.add("online");
+  } else if(selectedModel){
     btn.textContent = `🌐 ${selectedModel.model}`;
     btn.title = `Using ${selectedModel.model} (${selectedModel.provider}) for the next message`;
     btn.classList.add("online");
@@ -904,12 +931,29 @@ function pickModel(opt){
   renderModelBtn();
   updateCtxMeter();   // the context window denominator depends on which model is active
   closeModelMenu();
-  toast(opt ? `Next message routes to ${opt.model} (${opt.provider})` : "Back to the local model");
+  if(opt && opt.best) toast(`Best available — starts at ${opt.model}, auto-switches on rate limit`);
+  else toast(opt ? `Next message routes to ${opt.model} (${opt.provider})` : "Back to the local model");
+}
+// "Best available": starts the turn at the top of fallback_providers and
+// relies on Hermes' OWN retry loop (try_activate_fallback) to cascade
+// through the rest of the chain in-process if that model rate-limits — the
+// picker just needs to point at the current #1 entry, not manage the chain.
+function pickBest(){
+  if(!modelOptions.length) return;
+  pickModel({...modelOptions[0], best:true});
 }
 function closeModelMenu(){ const m=document.getElementById("modelmenu"); if(m) m.remove(); }
 function toggleModelMenu(){
   if(document.getElementById("modelmenu")){ closeModelMenu(); return; }
   const menu=document.createElement("div"); menu.className="modelmenu"; menu.id="modelmenu";
+  if(modelOptions.length){
+    const bestItem=document.createElement("div");
+    bestItem.className="item"+(selectedModel&&selectedModel.best?" sel":"");
+    bestItem.innerHTML=`<span>⚡ Use best available<small>auto-reroutes on rate limit</small></span>`;
+    bestItem.onclick=(e)=>{ e.stopPropagation(); pickBest(); };
+    menu.append(bestItem);
+    const sep0=document.createElement("div"); sep0.className="sep"; menu.append(sep0);
+  }
   const localItem=document.createElement("div");
   localItem.className="item"+(!selectedModel?" sel":"");
   localItem.innerHTML=`<span>🖥 Local (default)</span>`;
@@ -918,7 +962,7 @@ function toggleModelMenu(){
   if(modelOptions.length){
     const sep=document.createElement("div"); sep.className="sep"; menu.append(sep);
     modelOptions.forEach(opt=>{
-      const sel = selectedModel && selectedModel.model===opt.model && selectedModel.provider===opt.provider;
+      const sel = selectedModel && !selectedModel.best && selectedModel.model===opt.model && selectedModel.provider===opt.provider;
       const el=document.createElement("div"); el.className="item"+(sel?" sel":"");
       el.innerHTML=`<span>🌐 ${esc(opt.model)}<small>${esc(opt.provider)}</small></span>`;
       el.onclick=(e)=>{ e.stopPropagation(); pickModel(opt); };
@@ -1022,6 +1066,7 @@ function rebuildFromRecord(j){
     if(d.kind==="call") tools.push(`${t}  ● ${d.name}${d.args?" "+d.args:""}`);
     else if(d.kind==="result") tools.push(`${t}  ↳ ${d.text||""}`);
     else if(d.kind==="interim" && d.text) interims.push(d.text);
+    else if(d.kind==="model_switch") tools.push(switchLine(d.from, d.to, d.ts));
     // "chunk" events are the final reply — covered by j.text
   });
   const parsed=parseTurn(j.text||"");
