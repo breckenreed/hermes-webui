@@ -201,6 +201,9 @@
   #mcpbtn .dot.warn{background:var(--amber);box-shadow:0 0 7px var(--amber)}
   #mcpbtn .dot.bad{background:var(--red);box-shadow:0 0 7px var(--red)}
   #mcpbtn.hasissue{color:var(--amber)}
+  .mcpstderr{background:var(--code);border:1px solid var(--border);border-left:2px solid var(--red);
+    border-radius:6px;padding:8px 10px;margin:2px 0 0;overflow-x:auto;white-space:pre;
+    font-family:var(--mono);font-size:11px;line-height:1.45;color:var(--muted);max-height:190px}
 
   #mcpmodal{display:none;position:fixed;inset:0;background:var(--overlay);z-index:80;
     align-items:center;justify-content:center;padding:20px}
@@ -1259,9 +1262,13 @@ $("#themebtn").onclick=()=>{
    an unset ${VAR} as a literal placeholder, so the server starts happily and
    advertises everything, then every call 401s. That shows as amber, not green. */
 const MCP_STATE_META = {
-  ok:            {cls:"ok",   badge:"connected"},
-  auth_required: {cls:"warn", badge:"auth required"},
-  unreachable:   {cls:"bad",  badge:"unreachable"},
+  ok:             {cls:"ok",   badge:"connected"},
+  auth_required:  {cls:"warn", badge:"auth required"},
+  unreachable:    {cls:"bad",  badge:"unreachable"},
+  // Its own state, not a flavour of "unreachable": nothing is wrong with the
+  // server or the network — the command simply isn't installed in the agent
+  // container, and the remedy (rebuild the image) is completely different.
+  missing_binary: {cls:"bad",  badge:"not installed"},
 };
 let mcpInfo=null, mcpLoading=false, mcpWarned=false;
 
@@ -1274,9 +1281,10 @@ async function fetchMcp(refresh){
     // Announce a problem once per page load, so a broken server is noticed
     // without having to open the panel first.
     const s=mcpInfo.summary||{};
-    if(!mcpWarned && (s.auth_required||s.unreachable)){
+    if(!mcpWarned && (s.auth_required||s.unreachable||s.missing_binary)){
       mcpWarned=true;
       const bits=[];
+      if(s.missing_binary) bits.push(`${s.missing_binary} not installed`);
       if(s.unreachable) bits.push(`${s.unreachable} unreachable`);
       if(s.auth_required) bits.push(`${s.auth_required} needing credentials`);
       toast(`⚹ MCP: ${bits.join(", ")} — click the MCP chip for details`);
@@ -1336,6 +1344,36 @@ function renderMcpPanel(){
     const sel=new Set(sv.selected_tools||[]);
     const tools=(sv.tools||[]);
 
+    // The server's own stderr. Hermes wraps stdio servers in a watchdog, so a
+    // command that dies on launch surfaces to the client only as a closed pipe
+    // — this log is the one place the actual traceback exists, and showing it
+    // is the difference between "Connection closed" and "FileNotFoundError:
+    // clickup-mcp". Only rendered when something is actually wrong.
+    const stderrHtml=(sv.stderr_tail||"").trim() ? `
+      <div class="mcpsec">
+        <h4>Server stderr — last launch</h4>
+        <pre class="mcpstderr">${esc(sv.stderr_tail)}</pre>
+      </div>` : "";
+
+    // Whether Hermes will bring this server back on its own after it dies
+    // mid-run. Invisible in config, so state it plainly.
+    const rc=sv.recycle||{};
+    const mins=n=>n>=3600?`${Math.round(n/3600)}h`:`${Math.round(n/60)}m`;
+    const recycleHtml=(sv.transport==="stdio") ? `
+      <div class="mcpsec">
+        <h4>Auto-recovery</h4>
+        <div class="envrow">
+          <span class="${rc.auto_reconnect?"have":"miss"}">${rc.auto_reconnect?"✓":"✗"}</span>
+          <span>${rc.auto_reconnect
+            ? `respawns on next use after ${[rc.idle_timeout_seconds&&mins(rc.idle_timeout_seconds)+" idle",
+                 rc.max_lifetime_seconds&&mins(rc.max_lifetime_seconds)+" lifetime"].filter(Boolean).join(" / ")}`
+            : "off — a server that dies mid-run stays dead for the rest of that turn"}</span>
+          <span style="color:var(--muted)">${rc.auto_reconnect
+            ? (rc.keepalive_interval?`keepalive ${rc.keepalive_interval}s`:"")
+            : "set idle_timeout_seconds to arm it"}</span>
+        </div>
+      </div>` : "";
+
     const envHtml=(sv.env_refs||[]).length ? `
       <div class="mcpsec">
         <h4>Credentials</h4>
@@ -1373,8 +1411,10 @@ function renderMcpPanel(){
       </div>
       <div class="tgt">${esc(sv.transport||"?")} · ${esc(sv.target||"?")}</div>
       <div class="detail ${meta.cls}">${esc(sv.detail||"")}</div>
+      ${stderrHtml}
       ${envHtml}
       ${toolsHtml}
+      ${recycleHtml}
     </div>`;
   }).join("")
   + `<div class="mcpempty" style="padding:6px 2px 0;font-size:11.5px;text-align:left">
