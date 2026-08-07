@@ -21,6 +21,9 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🌐 **Online model picker** — a composer button lists every entry in Hermes' `fallback_providers` config (Gemini, or anything else you've configured) as an on-demand choice, not just an automatic failover. Pick one and the next message routes through it (`-m <model> --provider <provider>` for that turn only — no config change, no restart); pick "🖥 Local" to go back. See [Online models](#online-models) below.
 - ⚡ **"Use best available" + automatic rate-limit rerouting** — one click starts a turn at the top of your `fallback_providers` hierarchy and lets Hermes' own retry loop cascade through the rest of the chain in-process if a model hits a rate limit, so a single turn can survive several models' quotas being exhausted without you doing anything. Because that switch is otherwise silent (Hermes only prints it to a live console, never to the transcript), the webui detects it by diffing the session's final model against what was requested and shows a persistent, timestamped notice — `⚠️ gemini-3.6-flash was rate-limited — continued on gemini-3-flash-preview` — plus a toast at the moment it happens.
 - 🩺 **Live health** indicator showing whether the Hermes container is reachable.
+- ⚹ **MCP server visibility** — a top-bar chip shows how many configured MCP servers are healthy; clicking it lists each one's transport, connection state, credential resolution, and every tool it advertises (marking which are actually offered to the agent after `tools.include`/`exclude`). Crucially it separates *reachable* from *authenticated*: an unset `${VAR}` isn't an error to Hermes — it passes the placeholder through literally, so the server starts and lists its tools while every call 401s. That reports as amber "auth required", not green. MCP calls also render distinctly in the transcript as `⚹ server › tool`, with rejected calls flagged. See [MCP servers](#mcp-servers).
+- 🎓 **Skills browser** — a chip listing every skill enabled for the next turn, grouped by category and filterable. Names only: a skill's `SKILL.md` body is read by Hermes on invocation, never by this panel, so browsing costs no context. See [Skills](#skills).
+- 🌗 **Dark & light themes** — "dark roast" and "light crema" on one warm palette, toggled from the top bar, persisted, defaulting to your OS preference and stamped before first paint (no flash). Every colour is a token, and both themes are checked against WCAG AA. See [Theming](#theming).
 - 📦 **Zero external frontend deps** — one HTML file, no CDN, works offline.
 
 ## How it works
@@ -242,6 +245,71 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `POST` | `/api/turn/{session}/ack` | Confirm receipt of a turn's outcome; the server then drops its record. Until acked, reconnects can replay it |
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
 | `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider,context_length,max_tokens}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain in order. Cached 5 min |
+| `GET`  | `/api/mcp` | MCP servers, health and discovered tools: `{servers:[{name,transport,target,state,connected,connect_ms,detail,tools,selected_tools,selected_prefixed,env_refs,missing_env}], summary}`. `?refresh=1` forces a re-probe. Cached 60s |
+| `GET`  | `/api/skills` | Skills enabled for the next turn: `{skills:[{name,category,source,trust,status}], total, categories, sources}`. Names only — no `SKILL.md` is ever read. `?refresh=1` bypasses the 5 min cache |
+
+## MCP servers
+
+Hermes loads MCP servers from `mcp_servers` in `~/.hermes/config.yaml` and exposes
+their tools to the agent as `mcp__<server>__<tool>`. Without a UI for it, a
+misconfigured or unauthenticated server is invisible — the only symptom is the
+agent quietly failing mid-turn.
+
+The **MCP chip** in the top bar shows `MCP <healthy>/<total>` with a status dot;
+clicking it opens a panel listing, per server: transport and command/URL,
+connection state and connect time, which `${VAR}` credentials resolve, and every
+tool the server advertises — marking which ones survive the server's
+`tools.include`/`tools.exclude` filter and are actually offered to the agent.
+
+Health deliberately distinguishes three states rather than up/down:
+
+| State | Meaning |
+|---|---|
+| `ok` (green) | Connected, and every referenced credential resolves |
+| `auth required` (amber) | Reachable, but a `${VAR}` it needs is unset — or the connection failed with an auth-shaped error |
+| `unreachable` (red) | The connection failed for any other reason |
+
+The amber state matters because an unset `${VAR}` is **not** an error to Hermes:
+it leaves the placeholder literal, so the server still starts and still
+advertises its full tool list, and the failure only lands later as a 401 on the
+first real API call. Green would be a lie there.
+
+In the transcript, MCP calls render as `⚹ <server> › <tool>` in a distinct
+colour so an external side effect is never mistaken for a local builtin, and a
+tool result that comes back rejected is flagged in red with a pointer to the panel.
+
+> Health probing runs `hermes mcp test` per server, which costs seconds each (and
+> blocks until `connect_timeout` on a dead one), so results are cached and polled
+> slowly. Use **Re-check** in the panel for an answer on demand.
+
+## Skills
+
+The **Skills chip** opens a searchable list of every skill enabled for the next
+turn, grouped by category, sourced from `hermes skills list --enabled-only`.
+
+This is intentionally names-only. Hermes puts a skills *index* (name plus a
+one-line description) in every system prompt and reads a skill's `SKILL.md` body
+only when the model actually invokes it — this panel sits on the index side of
+that boundary, so browsing what the agent can do costs no context and no disk
+reads. The panel reports the index's context cost using the figure `/api/context`
+already computes, so opening it adds no work on the agent side either.
+
+## Theming
+
+Two palettes on one warm axis, toggled with the ☾/☀ button in the top bar:
+**dark roast** (default) and **light crema**. The choice persists in
+`localStorage`; with none saved, the OS `prefers-color-scheme` decides. The
+theme is stamped onto `<html data-theme>` by a tiny inline script in `<head>`
+so there is no flash of the wrong palette before first paint.
+
+Every colour is a CSS custom property defined once per theme in
+`static/index.html` — no rule hardcodes one, which is what keeps the two themes
+from drifting as features are added. Names are semantic (`--dim`, `--line`,
+`--on-accent`) rather than literal, because the palettes invert: `--accent2` is
+*lighter* than `--accent` in dark and *darker* in light, since in both cases it
+means "accent used as text". Both themes are checked against WCAG AA (4.5:1 for
+body text) — the light theme's accent is deeper than the dark theme's for
+exactly that reason.
 
 ## Security notes
 
