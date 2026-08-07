@@ -109,11 +109,18 @@ def _docker(*args: str) -> list[str]:
     return [DOCKER_BIN, *args]
 
 
-def _exec_prefix() -> list[str]:
-    """docker exec into the Hermes container, passing the LLM key through."""
+def _exec_prefix(extra_env: dict | None = None) -> list[str]:
+    """docker exec into the Hermes container, passing the LLM key through.
+
+    `extra_env` adds more `-e` flags — used to widen Rich's table output (see
+    /api/skills), which otherwise wraps to an 80-column default and truncates
+    the very values we're trying to read.
+    """
     cmd = _docker("exec", "-i")
     if LLM_CLIENT_UID:
         cmd += ["-e", f"LLM_CLIENT_UID={LLM_CLIENT_UID}"]
+    for key, value in (extra_env or {}).items():
+        cmd += ["-e", f"{key}={value}"]
     cmd += [HERMES_CONTAINER]
     return cmd
 
@@ -806,6 +813,388 @@ async def models_info():
 
     data = {"primary": primary, "options": options}
     MODELS_CACHE.update(ts=now, data=data)
+    return data
+
+
+# ── MCP servers ──────────────────────────────────────────────────────────
+# Hermes reads MCP servers from `mcp_servers` in config.yaml and registers each
+# server's tools into the agent as `mcp__<server>__<tool>` (see
+# tools/mcp_tool.py: mcp_prefixed_tool_name). Neither `hermes mcp list` nor
+# `hermes mcp test` has a --json mode and BOTH exit 0 even when a server is
+# dead, so health can't be taken from a return code — the report below reads
+# the config directly (same `cat` trick as /api/models) and parses the human
+# output of `hermes mcp test` for liveness + tool discovery.
+
+# `${VAR}` / `${env:VAR}` — the two placeholder forms Hermes' _interpolate_env_
+# vars() resolves. An UNRESOLVED placeholder is the signal we care about most:
+# Hermes leaves it literal rather than erroring, so the server still launches
+# and still advertises its tools, and the failure only lands later as a 401 on
+# the first real API call. That's the difference between "server is down" and
+# "server is up but has no usable credentials", which the UI reports separately.
+MCP_ENV_REF_RE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+MCP_CONNECTED_RE = re.compile(r"✓\s*Connected\s*\((\d+)\s*ms\)")
+MCP_FAILED_RE = re.compile(r"✗\s*Connection failed\s*\((\d+)\s*ms\)\s*:?\s*(.*)")
+MCP_TOOLCOUNT_RE = re.compile(r"✓\s*Tools discovered:\s*(\d+)")
+# Tool rows are indented ~4 spaces; the "  Transport:" / "  Auth:" headers use
+# 2 and carry a colon, so a 3+ space indent plus a bare identifier excludes
+# them. Long descriptions can wrap to column 0 — those lines fail the indent
+# test and are skipped rather than being mistaken for another tool.
+MCP_TOOL_LINE_RE = re.compile(r"^\s{3,}([A-Za-z_][A-Za-z0-9_.-]*)\s{2,}(\S.*?)\s*$")
+
+# Substrings that mean "the server answered, but rejected our credentials" as
+# opposed to "we never reached it". Checked against the connection error text.
+MCP_AUTH_HINTS = (
+    "401", "403", "unauthorized", "forbidden", "invalid token", "invalid api key",
+    "authentication", "auth failed", "oauth", "api key", "apikey", "access denied",
+    "missing required environment", "credential",
+)
+
+# A probe of what a Hermes process in the container can actually resolve:
+# process env plus ~/.hermes/.env, which Hermes loads before interpolating (see
+# _load_mcp_config). Only names with a NON-EMPTY value count — an empty value
+# resolves the placeholder to "" and still breaks the server, so treating it as
+# "configured" would report a false green.
+_ENV_PROBE = r"""
+import json, os
+names = {k for k, v in os.environ.items() if str(v).strip()}
+try:
+    with open('/opt/data/.env', encoding='utf-8', errors='replace') as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, _, v = line.partition('=')
+            k = k.strip()
+            if k.startswith('export '):
+                k = k[7:].strip()
+            if v.strip().strip('\'"'):
+                names.add(k)
+except Exception:
+    pass
+print(json.dumps(sorted(names)))
+"""
+
+
+async def _container_env_names() -> set[str] | None:
+    """Env var names resolvable inside the container, with non-empty values.
+
+    None (not an empty set) when the probe itself failed — the container is
+    always going to have *some* env, so an empty result means we couldn't look
+    rather than "nothing is configured". The caller must not report every
+    credential as missing off the back of a failed probe.
+    """
+    try:
+        out = await _run_out(*_exec_prefix(), "python3", "-c", _ENV_PROBE, timeout=20)
+        names = set(json.loads(out[out.index("["):]))
+        return names or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _mcp_env_refs(cfg: dict) -> list[str]:
+    """Every ${VAR} referenced by a server's env values / HTTP headers."""
+    refs: list[str] = []
+    for block in (cfg.get("env"), cfg.get("headers")):
+        if not isinstance(block, dict):
+            continue
+        for value in block.values():
+            refs += MCP_ENV_REF_RE.findall(str(value or ""))
+    return sorted(set(refs))
+
+
+def _parse_mcp_test(output: str) -> dict:
+    """Turn `hermes mcp test <name>` console output into a structured result."""
+    res: dict = {"connected": False, "connect_ms": 0, "error": "",
+                 "tools": [], "tool_count": 0}
+    m = MCP_CONNECTED_RE.search(output)
+    if m:
+        res["connected"] = True
+        res["connect_ms"] = int(m.group(1))
+    m = MCP_FAILED_RE.search(output)
+    if m:
+        res["connect_ms"] = int(m.group(1))
+        res["error"] = m.group(2).strip()
+    m = MCP_TOOLCOUNT_RE.search(output)
+    if m:
+        res["tool_count"] = int(m.group(1))
+    # Tool rows only appear after the "Tools discovered" banner.
+    seen_banner = False
+    for line in output.splitlines():
+        if MCP_TOOLCOUNT_RE.search(line):
+            seen_banner = True
+            continue
+        if not seen_banner:
+            continue
+        hit = MCP_TOOL_LINE_RE.match(line)
+        if hit:
+            res["tools"].append({"name": hit.group(1),
+                                 "description": hit.group(2).strip()})
+    if not res["tool_count"]:
+        res["tool_count"] = len(res["tools"])
+    return res
+
+
+def _selected_tool_names(cfg: dict, discovered: list[dict]) -> list[str]:
+    """Which discovered tools survive this server's tools.include/exclude filter
+    — i.e. what the agent is actually offered, not just what the server has."""
+    names = [t["name"] for t in discovered]
+    tools_cfg = cfg.get("tools")
+    if not isinstance(tools_cfg, dict):
+        return names
+    inc = tools_cfg.get("include")
+    exc = tools_cfg.get("exclude")
+    if isinstance(inc, list) and inc:
+        allow = {str(x) for x in inc}
+        names = [n for n in names if n in allow]
+    if isinstance(exc, list) and exc:
+        deny = {str(x) for x in exc}
+        names = [n for n in names if n not in deny]
+    return names
+
+
+async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) -> dict:
+    """Config + live health for one MCP server.
+
+    States, in the order they're decided:
+      auth_required — a ${VAR} the server needs is unset, OR the connection
+                      failed with an auth-shaped error. The server may well be
+                      reachable and advertising tools; it just can't authenticate.
+      unreachable   — the connection failed for any other reason.
+      ok            — connected, and every referenced credential resolves.
+    """
+    transport = "http" if cfg.get("url") else "stdio"
+    target = str(cfg.get("url") or cfg.get("command") or "?")
+    if transport == "stdio" and cfg.get("args"):
+        target = " ".join([target] + [str(a) for a in cfg["args"]])
+
+    refs = _mcp_env_refs(cfg)
+    # env_names is None when the probe failed — leave `missing` empty so health
+    # falls back to what the connection test alone can prove, rather than
+    # accusing a correctly-configured server of having no credentials.
+    missing = [r for r in refs if r not in env_names] if env_names is not None else []
+
+    # Bound the wait: a dead stdio server burns the whole connect_timeout before
+    # `hermes mcp test` gives up, so allow for that plus process startup.
+    try:
+        connect_timeout = float(cfg.get("connect_timeout") or 60)
+    except (TypeError, ValueError):
+        connect_timeout = 60.0
+    budget = max(30.0, min(connect_timeout + 25.0, 200.0))
+
+    result = {"connected": False, "connect_ms": 0, "error": "", "tools": [], "tool_count": 0}
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "mcp", "test", name), timeout=budget)
+        result = _parse_mcp_test(out)
+    except asyncio.TimeoutError:
+        result["error"] = f"health check exceeded {int(budget)}s"
+    except Exception as e:  # noqa: BLE001
+        result["error"] = str(e)
+
+    err_l = (result["error"] or "").lower()
+    auth_shaped = any(h in err_l for h in MCP_AUTH_HINTS)
+    if missing or (result["error"] and auth_shaped):
+        state = "auth_required"
+    elif result["error"] or not result["connected"]:
+        state = "unreachable"
+    else:
+        state = "ok"
+
+    if missing:
+        # /opt/data/.env is where Hermes loads dotenv from, but in this compose
+        # setup that path is a read-only bind of hermes-docker/.env (the
+        # ${PWD}/.env line) — editing ~/.hermes/.env there has no effect, so
+        # name the file that actually wins.
+        detail = ("Credentials not configured: "
+                  + ", ".join(missing)
+                  + f". Set {'them' if len(missing) > 1 else 'it'} in the agent's "
+                    "/opt/data/.env (bind-mounted from DEV/hermes-docker/.env) "
+                    "— no rebuild or restart, each turn re-reads it.")
+        if result["connected"]:
+            # The interesting case: Hermes leaves the placeholder literal, so
+            # the process starts and lists its tools; the API rejects the bogus
+            # token only when a tool is actually called.
+            detail += (" The server is reachable and its tools are listed, but "
+                       "every call will fail authentication until then.")
+        elif result["error"]:
+            detail += f" Connection also failed: {result['error']}"
+    elif result["error"]:
+        detail = result["error"]
+    else:
+        detail = f"Connected in {result['connect_ms']}ms · {result['tool_count']} tools discovered"
+
+    selected = _selected_tool_names(cfg, result["tools"])
+    return {
+        "name": name,
+        "transport": transport,
+        "target": target,
+        "state": state,
+        "connected": result["connected"],
+        "connect_ms": result["connect_ms"],
+        "error": result["error"],
+        "detail": detail,
+        "tools": result["tools"],
+        "tool_count": result["tool_count"],
+        # Prefixed exactly as the agent sees them, so a tool name in the chat
+        # transcript can be traced straight back to this panel.
+        "selected_tools": selected,
+        "selected_prefixed": [f"mcp__{name}__{t}" for t in selected],
+        "env_refs": refs,
+        "missing_env": missing,
+    }
+
+
+MCP_CACHE: dict = {"ts": 0.0, "data": None}
+_MCP_LOCK = asyncio.Lock()
+
+
+@app.get("/api/mcp")
+async def mcp_status(refresh: int = 0):
+    """Configured MCP servers, their health, and the tools each one exposes.
+
+    Probing spawns `hermes mcp test` per server (seconds each, longer when one
+    is down), so results are cached for 60s and every server is probed
+    concurrently. `?refresh=1` forces a re-probe. The lock keeps a burst of
+    clients — the UI polls this — from stacking N identical probe runs.
+    """
+    import time
+
+    now = time.time()
+    if not refresh and MCP_CACHE["data"] and now - MCP_CACHE["ts"] < 60:
+        return MCP_CACHE["data"]
+
+    async with _MCP_LOCK:
+        now = time.time()
+        if not refresh and MCP_CACHE["data"] and now - MCP_CACHE["ts"] < 60:
+            return MCP_CACHE["data"]
+
+        servers_cfg: dict = {}
+        config_error = ""
+        try:
+            _, out = await asyncio.wait_for(
+                _run(*_exec_prefix(), "cat", "/opt/data/config.yaml"), timeout=15)
+            cfg = yaml.safe_load(out) or {}
+            raw = cfg.get("mcp_servers")
+            if isinstance(raw, dict):
+                servers_cfg = {k: v for k, v in raw.items() if isinstance(v, dict)}
+        except Exception as e:  # noqa: BLE001
+            config_error = str(e)
+
+        env_names = await _container_env_names() if servers_cfg else None
+        results = await asyncio.gather(
+            *(_probe_mcp_server(n, c, env_names) for n, c in servers_cfg.items()),
+            return_exceptions=True,
+        )
+        servers = []
+        for (name, _cfg), r in zip(servers_cfg.items(), results):
+            if isinstance(r, BaseException):
+                servers.append({"name": name, "state": "unreachable", "connected": False,
+                                "transport": "?", "target": "?", "detail": str(r),
+                                "error": str(r), "tools": [], "tool_count": 0,
+                                "selected_tools": [], "selected_prefixed": [],
+                                "env_refs": [], "missing_env": [], "connect_ms": 0})
+            else:
+                servers.append(r)
+        servers.sort(key=lambda s: s["name"])
+
+        data = {
+            "servers": servers,
+            "config_error": config_error,
+            "checked_at": time.time(),
+            "summary": {
+                "total": len(servers),
+                "ok": sum(1 for s in servers if s["state"] == "ok"),
+                "auth_required": sum(1 for s in servers if s["state"] == "auth_required"),
+                "unreachable": sum(1 for s in servers if s["state"] == "unreachable"),
+                "tools": sum(len(s.get("selected_prefixed") or []) for s in servers),
+            },
+        }
+        MCP_CACHE.update(ts=time.time(), data=data)
+        return data
+
+
+# ── Skills ───────────────────────────────────────────────────────────────
+# Hermes builds a skills INDEX into every system prompt — name + one-line
+# description per skill — and only reads a SKILL.md body when the model
+# actually invokes that skill. This endpoint mirrors that boundary exactly: it
+# lists what the agent currently has available and never opens a SKILL.md, so
+# checking "what can it do?" costs nothing and can't move the context needle.
+#
+# `hermes skills list` prints a Rich table with no --json mode. Rich sizes to
+# the terminal, and a non-TTY `docker exec` defaults to 80 columns, which
+# truncates longer names with an ellipsis ("songwriting-and-ai-mus…") — useless
+# for a name list. COLUMNS=200 makes Rich lay the table out wide enough that
+# nothing is elided.
+SKILLS_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def _parse_skills_table(output: str) -> list[dict]:
+    """Rows of `hermes skills list` → [{name, category, source, trust, status}]."""
+    skills: list[dict] = []
+    for line in output.splitlines():
+        line = line.strip()
+        # Data rows are the ones delimited by box-drawing pipes; the ┏━┳┓ rules
+        # and the title line are not.
+        if not line.startswith("│"):
+            continue
+        cells = [c.strip() for c in line.strip("│").split("│")]
+        if len(cells) < 5:
+            continue
+        name = cells[0]
+        if not name or name.lower() == "name":   # header row
+            continue
+        skills.append({
+            "name": name,
+            "category": cells[1] or "uncategorised",
+            "source": cells[2],
+            "trust": cells[3],
+            "status": cells[4],
+        })
+    return skills
+
+
+@app.get("/api/skills")
+async def skills_info(refresh: int = 0):
+    """Skills available to the agent right now — names only, no SKILL.md reads.
+
+    `--enabled-only` is what makes this answer "what will actually load for the
+    next turn" rather than "what happens to be installed on disk". Cached for
+    5 minutes; the set only changes when a skill is installed or toggled.
+    """
+    import time
+
+    now = time.time()
+    if not refresh and SKILLS_CACHE["data"] and now - SKILLS_CACHE["ts"] < 300:
+        return SKILLS_CACHE["data"]
+
+    skills: list[dict] = []
+    error = ""
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix({"COLUMNS": "200"}),
+                 "hermes", "skills", "list", "--enabled-only"), timeout=60)
+        skills = _parse_skills_table(out)
+        if not skills:
+            error = "no skills parsed from `hermes skills list`"
+    except Exception as e:  # noqa: BLE001
+        error = str(e)
+
+    categories: dict = {}
+    sources: dict = {}
+    for s in skills:
+        categories[s["category"]] = categories.get(s["category"], 0) + 1
+        sources[s["source"]] = sources.get(s["source"], 0) + 1
+
+    data = {
+        "skills": sorted(skills, key=lambda s: (s["category"], s["name"])),
+        "total": len(skills),
+        "categories": dict(sorted(categories.items())),
+        "sources": dict(sorted(sources.items())),
+        "error": error,
+        "checked_at": time.time(),
+    }
+    SKILLS_CACHE.update(ts=time.time(), data=data)
     return data
 
 
