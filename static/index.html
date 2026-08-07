@@ -212,6 +212,35 @@
   #mcpbtn .dot.warn{background:var(--amber);box-shadow:0 0 7px var(--amber)}
   #mcpbtn .dot.bad{background:var(--red);box-shadow:0 0 7px var(--red)}
   #mcpbtn.hasissue{color:var(--amber)}
+  .trow.x{cursor:pointer;user-select:none}
+  .trow.x:hover,.trow.x:focus-visible{background:var(--panel2);outline:none}
+  .trow.x:focus-visible{box-shadow:inset 0 0 0 1px var(--accent)}
+  .trow .chev{display:inline-block;width:11px;color:var(--muted);font-size:9px;
+    vertical-align:middle;margin-right:2px}
+  .trow.open .chev{color:var(--accent)}
+  .tdet{padding:2px 10px 11px 24px;border-left:2px solid var(--border);margin:0 0 4px 8px}
+  .tdet .tdesc{margin:4px 0 8px;font-size:12.5px;line-height:1.55;color:var(--text);white-space:pre-wrap}
+  .tdet .tmeta{display:flex;gap:8px;align-items:baseline;margin:5px 0;flex-wrap:wrap}
+  .tdet .tmeta b{font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;
+    color:var(--muted);flex:0 0 78px}
+  .tdet .chips{display:flex;gap:5px;flex-wrap:wrap;flex:1;min-width:0}
+  /* A prefixed tool name (mcp__server__tool) is one unbreakable token wide
+     enough to push the panel into horizontal scroll on a phone — let chips
+     break anywhere rather than making the whole list slide sideways. */
+  .tdet .chip{background:var(--code);border:1px solid var(--border);border-radius:5px;
+    padding:1px 6px;font-family:var(--mono);font-size:11px;color:var(--muted);
+    overflow-wrap:anywhere;word-break:break-word;max-width:100%}
+  .tdet .chip.req{color:var(--accent2);border-color:var(--accent)}
+  @media (max-width:720px){
+    /* Stack the label above its chips: the fixed 78px gutter costs too much
+       of a 339px panel. */
+    .tdet{padding-left:12px;margin-left:4px}
+    .tdet .tmeta{flex-direction:column;gap:3px}
+    .tdet .tmeta b{flex:none}
+  }
+  .mcpstderr{background:var(--code);border:1px solid var(--border);border-left:2px solid var(--red);
+    border-radius:6px;padding:8px 10px;margin:2px 0 0;overflow-x:auto;white-space:pre;
+    font-family:var(--mono);font-size:11px;line-height:1.45;color:var(--muted);max-height:190px}
 
   #mcpmodal{display:none;position:fixed;inset:0;background:var(--overlay);z-index:80;
     align-items:center;justify-content:center;padding:20px}
@@ -1338,9 +1367,13 @@ $("#themebtn").onclick=()=>{
    an unset ${VAR} as a literal placeholder, so the server starts happily and
    advertises everything, then every call 401s. That shows as amber, not green. */
 const MCP_STATE_META = {
-  ok:            {cls:"ok",   badge:"connected"},
-  auth_required: {cls:"warn", badge:"auth required"},
-  unreachable:   {cls:"bad",  badge:"unreachable"},
+  ok:             {cls:"ok",   badge:"connected"},
+  auth_required:  {cls:"warn", badge:"auth required"},
+  unreachable:    {cls:"bad",  badge:"unreachable"},
+  // Its own state, not a flavour of "unreachable": nothing is wrong with the
+  // server or the network — the command simply isn't installed in the agent
+  // container, and the remedy (rebuild the image) is completely different.
+  missing_binary: {cls:"bad",  badge:"not installed"},
 };
 let mcpInfo=null, mcpLoading=false, mcpWarned=false;
 
@@ -1353,9 +1386,10 @@ async function fetchMcp(refresh){
     // Announce a problem once per page load, so a broken server is noticed
     // without having to open the panel first.
     const s=mcpInfo.summary||{};
-    if(!mcpWarned && (s.auth_required||s.unreachable)){
+    if(!mcpWarned && (s.auth_required||s.unreachable||s.missing_binary)){
       mcpWarned=true;
       const bits=[];
+      if(s.missing_binary) bits.push(`${s.missing_binary} not installed`);
       if(s.unreachable) bits.push(`${s.unreachable} unreachable`);
       if(s.auth_required) bits.push(`${s.auth_required} needing credentials`);
       toast(`⚹ MCP: ${bits.join(", ")} — click the MCP chip for details`);
@@ -1415,6 +1449,36 @@ function renderMcpPanel(){
     const sel=new Set(sv.selected_tools||[]);
     const tools=(sv.tools||[]);
 
+    // The server's own stderr. Hermes wraps stdio servers in a watchdog, so a
+    // command that dies on launch surfaces to the client only as a closed pipe
+    // — this log is the one place the actual traceback exists, and showing it
+    // is the difference between "Connection closed" and "FileNotFoundError:
+    // clickup-mcp". Only rendered when something is actually wrong.
+    const stderrHtml=(sv.stderr_tail||"").trim() ? `
+      <div class="mcpsec">
+        <h4>Server stderr — last launch</h4>
+        <pre class="mcpstderr">${esc(sv.stderr_tail)}</pre>
+      </div>` : "";
+
+    // Whether Hermes will bring this server back on its own after it dies
+    // mid-run. Invisible in config, so state it plainly.
+    const rc=sv.recycle||{};
+    const mins=n=>n>=3600?`${Math.round(n/3600)}h`:`${Math.round(n/60)}m`;
+    const recycleHtml=(sv.transport==="stdio") ? `
+      <div class="mcpsec">
+        <h4>Auto-recovery</h4>
+        <div class="envrow">
+          <span class="${rc.auto_reconnect?"have":"miss"}">${rc.auto_reconnect?"✓":"✗"}</span>
+          <span>${rc.auto_reconnect
+            ? `respawns on next use after ${[rc.idle_timeout_seconds&&mins(rc.idle_timeout_seconds)+" idle",
+                 rc.max_lifetime_seconds&&mins(rc.max_lifetime_seconds)+" lifetime"].filter(Boolean).join(" / ")}`
+            : "off — a server that dies mid-run stays dead for the rest of that turn"}</span>
+          <span style="color:var(--muted)">${rc.auto_reconnect
+            ? (rc.keepalive_interval?`keepalive ${rc.keepalive_interval}s`:"")
+            : "set idle_timeout_seconds to arm it"}</span>
+        </div>
+      </div>` : "";
+
     const envHtml=(sv.env_refs||[]).length ? `
       <div class="mcpsec">
         <h4>Credentials</h4>
@@ -1430,13 +1494,30 @@ function renderMcpPanel(){
       <div class="mcpsec">
         <h4>Tools discovered — ${tools.length} on the server, ${sel.size} offered to the agent</h4>
         <div class="tlist">
-          ${tools.map(t=>{
+          ${tools.map((t,i)=>{
             const on=sel.has(t.name);
-            return `<div class="trow${on?"":" off"}" title="${on?esc("mcp__"+sv.name+"__"+t.name):"filtered out by tools.include / tools.exclude"}">
-              <span class="tn">${esc(t.name)}</span>
+            // Expandable only when the cache actually gave us more than the
+            // console's truncated line — otherwise the chevron would promise
+            // detail that isn't there.
+            const full=(t.full_description||"").trim();
+            const acts=t.actions||[], pars=t.params||[], req=new Set(t.required_params||[]);
+            const more = full || acts.length || pars.length;
+            const id=`t_${sv.name}_${i}`;
+            return `<div class="trow${on?"":" off"}${more?" x":""}"
+                 ${more?`data-tool="${id}" role="button" tabindex="0" aria-expanded="false"`:""}
+                 title="${on?esc("mcp__"+sv.name+"__"+t.name):"filtered out by tools.include / tools.exclude"}">
+              <span class="tn">${more?`<span class="chev">▸</span>`:""}${esc(t.name)}</span>
               ${on?"":`<span class="off-tag">not enabled</span>`}
               <span class="td">${esc(t.description||"")}</span>
-            </div>`;
+            </div>
+            ${more?`<div class="tdet" id="${id}" hidden>
+              ${full?`<p class="tdesc">${esc(full)}</p>`:""}
+              ${acts.length?`<div class="tmeta"><b>Actions</b><span class="chips">${
+                acts.map(a=>`<code class="chip">${esc(a)}</code>`).join("")}</span></div>`:""}
+              ${pars.length?`<div class="tmeta"><b>Parameters</b><span class="chips">${
+                pars.map(p=>`<code class="chip${req.has(p)?" req":""}">${esc(p)}${req.has(p)?"*":""}</code>`).join("")}</span></div>`:""}
+              ${on?`<div class="tmeta"><b>Call as</b><span class="chips"><code class="chip">${esc("mcp__"+sv.name+"__"+t.name)}</code></span></div>`:""}
+            </div>`:""}`;
           }).join("")}
         </div>
       </div>` : `
@@ -1452,14 +1533,39 @@ function renderMcpPanel(){
       </div>
       <div class="tgt">${esc(sv.transport||"?")} · ${esc(sv.target||"?")}</div>
       <div class="detail ${meta.cls}">${esc(sv.detail||"")}</div>
+      ${stderrHtml}
       ${envHtml}
       ${toolsHtml}
+      ${recycleHtml}
     </div>`;
   }).join("")
   + `<div class="mcpempty" style="padding:6px 2px 0;font-size:11.5px;text-align:left">
        The agent sees these as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>; calls to them appear
        in blue in the transcript.</div>`;
 }
+
+/* Expand/collapse one tool's full schema. Delegated from the panel body so it
+   survives every re-render (Re-check, poll) without rebinding, and so keyboard
+   users get the same affordance as the mouse. */
+function toggleToolDetail(row){
+  const det=document.getElementById(row.dataset.tool);
+  if(!det) return;
+  const open=det.hasAttribute("hidden");
+  det.toggleAttribute("hidden", !open);
+  row.setAttribute("aria-expanded", open?"true":"false");
+  row.classList.toggle("open", open);
+  const chev=row.querySelector(".chev");
+  if(chev) chev.textContent = open?"▾":"▸";
+}
+$("#mcpbody").addEventListener("click", e=>{
+  const row=e.target.closest(".trow[data-tool]");
+  if(row) toggleToolDetail(row);
+});
+$("#mcpbody").addEventListener("keydown", e=>{
+  if(e.key!=="Enter" && e.key!==" ") return;
+  const row=e.target.closest(".trow[data-tool]");
+  if(row){ e.preventDefault(); toggleToolDetail(row); }
+});
 
 function openMcpPanel(){
   $("#mcpmodal").classList.add("show");
