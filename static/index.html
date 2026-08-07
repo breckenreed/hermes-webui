@@ -141,6 +141,17 @@
   .msg .body pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto;margin:8px 0}
   .msg .body pre code{background:none;border:none;padding:0;font-size:12.5px;line-height:1.5;display:block}
   .msg .body a{color:var(--accent2)}
+  /* Tables scroll inside their own wrapper — a wide one must never make the
+     whole chat pane scroll sideways, especially on a phone. */
+  .msg .body .tablewrap{overflow-x:auto;margin:10px 0;border:1px solid var(--border);border-radius:8px}
+  .msg .body table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.5}
+  .msg .body th,.msg .body td{padding:7px 11px;text-align:left;vertical-align:top;
+    border-bottom:1px solid var(--border);border-right:1px solid var(--border)}
+  .msg .body th:last-child,.msg .body td:last-child{border-right:none}
+  .msg .body tbody tr:last-child td{border-bottom:none}
+  .msg .body th{background:var(--panel2);font-weight:600;color:var(--text)}
+  .msg .body tbody tr:nth-child(even){background:var(--code)}
+  .msg .body td code,.msg .body th code{white-space:nowrap}
   .msg.assistant .body{color:var(--text)}
   .tool{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--panel2);border:1px solid var(--border);border-left:2px solid var(--accent);border-radius:5px;padding:6px 10px;margin:4px 0;white-space:pre-wrap;word-break:break-word}
   .cursor{display:inline-block;width:8px;height:15px;background:var(--accent);animation:blink 1s steps(2) infinite;vertical-align:text-bottom;margin-left:2px}
@@ -557,11 +568,63 @@ function renderMarkdown(src){
   });
   return html;
 }
+/* ---------- GFM pipe tables ----------
+   Models emit these constantly (comparison / summary tables). Without support
+   every row fell through to the `<p>` branch below and rendered as a column of
+   literal `| a | b |` lines — correct if you pasted it into a .md file, but
+   unreadable in the browser, which is the only place it's actually being read.
+
+   A table is recognised only by the strong two-line signal GFM requires: a row
+   of cells followed by a delimiter row (`| :--- | ---: |`) with the SAME cell
+   count. Requiring the counts to match is what stops a setext heading (`---`)
+   under a line that happens to contain a pipe from being mistaken for a table.
+   Anything that doesn't match falls through untouched, so ordinary prose
+   containing a `|` renders exactly as before. */
+const TABLE_DELIM_RE = /^\s*\|?\s*:?-{1,}:?\s*(?:\|\s*:?-{1,}:?\s*)*\|?\s*$/;
+
+// Split a row on the pipes that actually delimit cells — not ones escaped as
+// `\|`, and not ones inside a `code span` (regex arguments in a tool-output
+// table are full of them).
+function splitRow(line){
+  let s = line.trim();
+  if(s.startsWith("|")) s = s.slice(1);
+  if(s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+  const cells=[]; let cur="", inCode=false;
+  for(let i=0;i<s.length;i++){
+    const c=s[i];
+    if(c==="\\" && s[i+1]==="|"){ cur+="|"; i++; continue; }
+    if(c==="`") inCode=!inCode;
+    if(c==="|" && !inCode){ cells.push(cur); cur=""; continue; }
+    cur+=c;
+  }
+  cells.push(cur);
+  return cells.map(c=>c.trim());
+}
+function cellAlign(spec){
+  const c=(spec||"").trim();
+  const l=c.startsWith(":"), r=c.endsWith(":");
+  return l&&r ? "center" : r ? "right" : l ? "left" : "";
+}
+function tableHtml(head, aligns, rows){
+  const cell=(txt,tag,al)=>`<${tag}${al?` style="text-align:${al}"`:""}>${renderInlineNoBlock(txt||"")}</${tag}>`;
+  let h='<div class="tablewrap"><table><thead><tr>';
+  head.forEach((c,i)=> h+=cell(c,"th",aligns[i]));
+  h+="</tr></thead><tbody>";
+  rows.forEach(r=>{
+    h+="<tr>";
+    // Pad/truncate to the header width so a ragged row can't skew the columns.
+    for(let i=0;i<head.length;i++) h+=cell(r[i],"td",aligns[i]);
+    h+="</tr>";
+  });
+  return h+"</tbody></table></div>";
+}
+
 function renderInline(text){
   const lines = text.split("\n");
   let out="", listOpen=null;
   const flush=()=>{ if(listOpen){out+=`</${listOpen}>`;listOpen=null;} };
-  for(let ln of lines){
+  for(let i=0;i<lines.length;i++){
+    const ln = lines[i];
     let h = esc(ln);
     h = h.replace(/`([^`]+)`/g,"<code>$1</code>");
     h = h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
@@ -569,6 +632,21 @@ function renderInline(text){
     h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
     let m;
     if((m=ln.match(/^(#{1,3})\s+(.*)/))){ flush(); out+=`<h${m[1].length}>${renderInlineNoBlock(m[2])}</h${m[1].length}>`; continue; }
+    // Table — checked before lists, since a delimiter row starting with "-"
+    // would otherwise be eaten by the <ul> branch.
+    if(ln.includes("|") && i+1<lines.length && TABLE_DELIM_RE.test(lines[i+1])){
+      const head=splitRow(ln), aligns=splitRow(lines[i+1]).map(cellAlign);
+      if(head.length>=2 && head.length===aligns.length){
+        flush();
+        let j=i+2; const rows=[];
+        while(j<lines.length && lines[j].trim()!=="" && lines[j].includes("|")){
+          rows.push(splitRow(lines[j])); j++;
+        }
+        out += tableHtml(head, aligns, rows);
+        i = j-1;
+        continue;
+      }
+    }
     if((m=ln.match(/^\s*[-*]\s+(.*)/))){ if(listOpen!=="ul"){flush();out+="<ul>";listOpen="ul";} out+=`<li>${renderInlineNoBlock(m[1])}</li>`; continue; }
     if((m=ln.match(/^\s*\d+\.\s+(.*)/))){ if(listOpen!=="ol"){flush();out+="<ol>";listOpen="ol";} out+=`<li>${renderInlineNoBlock(m[1])}</li>`; continue; }
     if(ln.trim()===""){ flush(); continue; }
@@ -580,6 +658,7 @@ function renderInline(text){
 function renderInlineNoBlock(t){
   return esc(t).replace(/`([^`]+)`/g,"<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*]+)\*/g,"$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
 }
 
