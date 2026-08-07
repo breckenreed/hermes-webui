@@ -4,13 +4,85 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Hermes · WebUI</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d0f12'/%3E%3Cpath d='M16 5l9.5 5.5v11L16 27l-9.5-5.5v-11z' fill='none' stroke='%23e07b39' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M12 11v10M20 11v10M12 16h8' stroke='%23f0a868' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
-<meta name="theme-color" content="#0d0f12" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e1813'/%3E%3Cpath d='M16 5l9.5 5.5v11L16 27l-9.5-5.5v-11z' fill='none' stroke='%23e07b39' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M12 11v10M20 11v10M12 16h8' stroke='%23f0a868' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
+<meta name="theme-color" content="#16110d" />
+<script>
+  /* Stamp the theme onto <html> BEFORE any CSS is applied — doing this from the
+     main script block instead would paint one frame of the wrong palette and
+     flash. An explicit choice wins; otherwise follow the OS. Kept deliberately
+     tiny and dependency-free since it blocks first paint. */
+  (function(){
+    var t;
+    try{ t = localStorage.getItem("hermes_theme"); }catch(e){}
+    if(t !== "light" && t !== "dark")
+      t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
 <style>
+  /* ── Theme tokens ────────────────────────────────────────────────────────
+     Two palettes on one warm axis, so the orange accent this UI already used
+     reads as deliberate rather than accidental:
+       dark  — dark roast. The neutrals were blue-grey (#0d0f12/#252b33), which
+               fought the orange; they're now brown at the same lightness, so
+               the whole shell sits on one hue family.
+       light — crema / crème brûlée. Cream grounds, deep coffee text.
+     EVERY colour below is a token and no rule hardcodes one, which is what
+     keeps the two themes from drifting apart as things get added. Semantic
+     names (--dim, --line, --on-accent) rather than literal ones (--grey3)
+     because the two palettes invert: --accent2 is LIGHTER than --accent in
+     dark and DARKER in light, since in both cases it's "accent as text". */
+  :root[data-theme="dark"]{
+    --bg:#16110d; --panel:#1e1813; --panel2:#272019; --border:#3a2f24;
+    --text:#f2e9df; --muted:#a99381; --accent:#e07b39; --accent2:#f0a868;
+    --user:#2c2016; --assistant:#1d1712; --code:#120e0a;
+    --green:#57b95f; --red:#f4776b; --amber:#f0b429; --info:#6fbfab;
+    --on-accent:#241304;                  /* text on a filled accent button */
+    --on-danger:#2a0d08;                  /* text on the filled Stop button */
+    --dim:#9c8570;                        /* timestamps — least-important text */
+    --line:#4a3d31;                       /* neutral rule (tool-result bar, dots) */
+    --hover:#332a21;                      /* scrollbar thumb, icon-button hover */
+    --overlay:rgba(12,8,4,.62);           /* modal / drawer scrim */
+    --shadow:rgba(0,0,0,.5);
+    --accent-soft:rgba(224,123,57,.16);   /* tinted "on" states */
+    --accent-soft2:rgba(224,123,57,.12);
+    --green-soft:rgba(87,185,95,.14);
+    --green-text:#8fdc95;
+    --red-hover:#ff6b60;
+    --amber-text:#f5cf7a;
+    --red-text:#ff9d96;
+    --info-text:#9ad9c9;
+    --code-inset:#0b0805;                 /* code chip inside a detail panel */
+    color-scheme:dark;
+  }
+  :root[data-theme="light"]{
+    --bg:#fdf6ea; --panel:#f8eeda; --panel2:#f2e4cd; --border:#e2cfb1;
+    /* Tuned against WCAG on the cream grounds, not picked by eye: --muted sits
+       at 6.1:1 on --bg / 5.7:1 on --panel (it carries a lot of small text), and
+       --accent is deeper than the dark theme's orange purely so white button
+       labels clear 4.5:1 — at the dark theme's #e07b39 they land at 3.4:1. */
+    --text:#3b2c1e; --muted:#6f5a45; --accent:#a85916; --accent2:#8a4a0d;
+    --user:#eeddbe; --assistant:#f8eeda; --code:#f4e8d4;
+    --green:#2f7d3a; --red:#b3261e; --amber:#8a5f05; --info:#2b7d6f;
+    --on-accent:#fff8ef;
+    --on-danger:#fff5f2;
+    --dim:#7f6a52;
+    --line:#d8c5a6;
+    --hover:#ead8bb;
+    --overlay:rgba(58,40,22,.38);
+    --shadow:rgba(110,80,48,.22);
+    --accent-soft:rgba(200,112,31,.16);
+    --accent-soft2:rgba(200,112,31,.12);
+    --green-soft:rgba(47,125,58,.14);
+    --green-text:#276a2f;
+    --red-hover:#8f1c16;
+    --amber-text:#7a5305;
+    --red-text:#9d221b;
+    --info-text:#22685c;
+    --code-inset:#eadcc2;
+    color-scheme:light;
+  }
   :root{
-    --bg:#0d0f12; --panel:#14171c; --panel2:#191d23; --border:#252b33;
-    --text:#e6e8eb; --muted:#8b949e; --accent:#e07b39; --accent2:#f0a868;
-    --user:#1c2937; --assistant:#16191f; --code:#0a0c0f; --green:#3fb950; --red:#f85149;
     --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   }
@@ -25,7 +97,7 @@
   #brand .dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red)}
   #brand .dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
   #brand small{color:var(--muted);font-family:var(--mono);font-size:11px;display:block;margin-top:4px}
-  #newchat{margin:12px;padding:10px;background:var(--accent);color:#111;border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px}
+  #newchat{margin:12px;padding:10px;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px}
   #newchat:hover{background:var(--accent2)}
   #seslabel{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.8px;padding:4px 16px}
   #sessions{flex:1;overflow-y:auto;padding:0 8px 12px}
@@ -37,16 +109,16 @@
   .ses .dots{position:absolute;top:6px;right:6px;width:22px;height:22px;border:none;background:transparent;color:var(--muted);
     border-radius:5px;cursor:pointer;font-size:15px;line-height:1;opacity:0;display:flex;align-items:center;justify-content:center}
   .ses:hover .dots,.ses.active .dots{opacity:1}
-  .ses .dots:hover{background:#2a3038;color:var(--text)}
+  .ses .dots:hover{background:var(--hover);color:var(--text)}
   .menu{position:fixed;z-index:50;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:4px;
-    box-shadow:0 8px 26px rgba(0,0,0,.5);min-width:150px}
+    box-shadow:0 8px 26px var(--shadow);min-width:150px}
   .menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--text);
     padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px;font-family:var(--sans)}
   .menu button:hover{background:var(--panel)}
   .menu button.danger{color:var(--red)}
   .menu .sep{height:1px;background:var(--border);margin:4px 2px}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);
-    color:var(--text);padding:9px 16px;border-radius:8px;font-size:13px;z-index:60;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+    color:var(--text);padding:9px 16px;border-radius:8px;font-size:13px;z-index:60;box-shadow:0 6px 20px var(--shadow)}
 
   /* Main */
   #main{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -58,7 +130,7 @@
   .msg{display:flex;gap:14px;padding:16px 0}
   .msg .av{flex:0 0 28px;width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;font-family:var(--mono)}
   .msg.user .av{background:var(--user);color:var(--accent2)}
-  .msg.assistant .av{background:var(--accent);color:#111}
+  .msg.assistant .av{background:var(--accent);color:var(--on-accent)}
   .msg .body{flex:1;min-width:0;padding-top:3px;line-height:1.6;font-size:14.5px}
   .msg .body p{margin:0 0 10px}
   .msg .body p:last-child{margin-bottom:0}
@@ -83,33 +155,33 @@
   #input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:10px;color:var(--text);
     font-family:var(--sans);font-size:14px;padding:11px 14px;resize:none;max-height:200px;line-height:1.5;outline:none}
   #input:focus{border-color:var(--accent)}
-  #send{background:var(--accent);color:#111;border:none;border-radius:10px;width:44px;height:44px;cursor:pointer;font-size:18px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;line-height:1}
+  #send{background:var(--accent);color:var(--on-accent);border:none;border-radius:10px;width:44px;height:44px;cursor:pointer;font-size:18px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;line-height:1}
   #send:disabled{opacity:.4;cursor:not-allowed}
   #send:hover:not(:disabled){background:var(--accent2)}
-  #send.stopping{background:var(--red);color:#fff;font-size:15px}
-  #send.stopping:hover{background:#ff6b60}
+  #send.stopping{background:var(--red);color:var(--on-danger);font-size:15px}
+  #send.stopping:hover{background:var(--red-hover)}
   #ctxmeter{cursor:help}
-  #ctxmeter.warn{color:#f0b429}
+  #ctxmeter.warn{color:var(--amber)}
   #ctxmeter.danger{color:var(--red)}
   .tool.call{border-left-color:var(--accent);color:var(--accent2)}
-  .tool.result{border-left-color:#3d4753;color:var(--muted)}
-  .tool.switch{border-left-color:#f0b429;color:#f0b429;font-weight:600}
-  .tool .ts{color:#5a6570}
-  .msgtime{color:#5a6570;font-family:var(--mono);font-size:10.5px;margin-top:6px}
+  .tool.result{border-left-color:var(--line);color:var(--muted)}
+  .tool.switch{border-left-color:var(--amber);color:var(--amber);font-weight:600}
+  .tool .ts{color:var(--dim)}
+  .msgtime{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:6px}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
   #agentbtn{background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:10px;
     height:44px;padding:0 12px;cursor:pointer;font-size:12px;font-weight:600;flex:0 0 auto;white-space:nowrap;
     display:flex;align-items:center;gap:5px}
   #agentbtn:hover{border-color:var(--accent)}
-  #agentbtn.on{background:rgba(224,123,57,.16);color:var(--accent2);border-color:var(--accent)}
+  #agentbtn.on{background:var(--accent-soft);color:var(--accent2);border-color:var(--accent)}
   #modelbtn{background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:10px;
     height:44px;padding:0 12px;cursor:pointer;font-size:12px;font-weight:600;flex:0 0 auto;white-space:nowrap;
     max-width:180px;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:5px}
   #modelbtn:hover{border-color:var(--accent)}
-  #modelbtn.online{background:rgba(63,185,80,.14);color:#7ee08a;border-color:var(--green)}
+  #modelbtn.online{background:var(--green-soft);color:var(--green-text);border-color:var(--green)}
   .modelmenu{position:absolute;bottom:100%;right:0;margin-bottom:6px;background:var(--panel2);
-    border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px rgba(0,0,0,.5);
+    border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px var(--shadow);
     z-index:20;min-width:230px}
   .modelmenu .item{padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px;display:flex;
     align-items:center;justify-content:space-between;gap:8px}
@@ -118,9 +190,89 @@
   .modelmenu .item small{display:block;color:var(--muted);font-size:11px;font-family:var(--mono)}
   .modelmenu .sep{height:1px;background:var(--border);margin:4px 2px}
   .hint{max-width:820px;margin:6px auto 0;padding:0 20px;color:var(--muted);font-size:11px;font-family:var(--mono)}
-  ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:#2a3038;border-radius:5px}
+  /* ── MCP: status chip (topbar) + inspector panel ── */
+  #mcpbtn,#skillsbtn,#themebtn{background:none;border:1px solid transparent;border-radius:7px;color:var(--muted);
+    font-family:var(--mono);font-size:12px;padding:3px 8px;cursor:pointer;display:flex;
+    align-items:center;gap:6px;white-space:nowrap}
+  #mcpbtn:hover,#skillsbtn:hover,#themebtn:hover{border-color:var(--border);background:var(--panel2);color:var(--text)}
+  #themebtn{font-size:13px}
+  #mcpbtn .dot{width:7px;height:7px;border-radius:50%;background:var(--line);flex:0 0 7px}
+  #mcpbtn .dot.ok{background:var(--green);box-shadow:0 0 7px var(--green)}
+  #mcpbtn .dot.warn{background:var(--amber);box-shadow:0 0 7px var(--amber)}
+  #mcpbtn .dot.bad{background:var(--red);box-shadow:0 0 7px var(--red)}
+  #mcpbtn.hasissue{color:var(--amber)}
 
-  .queuebar{max-width:820px;margin:0 auto 6px;padding:7px 12px;border-radius:8px;background:rgba(224,123,57,.12);
+  #mcpmodal{display:none;position:fixed;inset:0;background:var(--overlay);z-index:80;
+    align-items:center;justify-content:center;padding:20px}
+  #mcpmodal.show{display:flex}
+  #mcpmodal .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    width:min(96vw,720px);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 18px 50px var(--shadow)}
+  #mcpmodal .head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+  #mcpmodal .head h2{margin:0;font-size:15px;flex:1}
+  #mcpmodal .head .sub{color:var(--muted);font-size:11px;font-family:var(--mono);font-weight:400;display:block;margin-top:3px}
+  #mcpmodal .head button{background:var(--panel2);border:1px solid var(--border);color:var(--text);
+    border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+  #mcpmodal .head button:hover{border-color:var(--accent)}
+  #mcpmodal .head button:disabled{opacity:.5;cursor:progress}
+  #mcpmodal .bd{overflow-y:auto;padding:14px 18px 18px}
+  .mcpsrv{border:1px solid var(--border);border-radius:9px;background:var(--panel2);padding:12px 14px;margin-bottom:12px}
+  .mcpsrv .row1{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .mcpsrv .nm{font-family:var(--mono);font-size:13.5px;color:var(--text);font-weight:600}
+  .badge{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;
+    padding:2px 7px;border-radius:20px;border:1px solid currentColor}
+  .badge.ok{color:var(--green)} .badge.warn{color:var(--amber)} .badge.bad{color:var(--red)}
+  .mcpsrv .tgt{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:6px;word-break:break-all}
+  .mcpsrv .detail{font-size:12.5px;line-height:1.5;margin-top:8px;padding:8px 10px;border-radius:6px;
+    background:var(--code);border-left:2px solid var(--border)}
+  .mcpsrv .detail.warn{border-left-color:var(--amber);color:var(--amber-text)}
+  .mcpsrv .detail.bad{border-left-color:var(--red);color:var(--red-text)}
+  .mcpsrv .detail.ok{border-left-color:var(--green);color:var(--muted)}
+  .mcpsrv .detail code{background:var(--code-inset);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-family:var(--mono);font-size:11.5px}
+  .mcpsec{margin-top:11px}
+  .mcpsec h4{margin:0 0 6px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.7px;font-weight:600}
+  .envrow{font-family:var(--mono);font-size:12px;padding:3px 0;display:flex;align-items:center;gap:7px}
+  .envrow .miss{color:var(--red)} .envrow .have{color:var(--green)}
+  .tlist{display:flex;flex-direction:column;gap:1px}
+  .trow{display:flex;gap:9px;padding:5px 7px;border-radius:5px;align-items:baseline}
+  .trow:hover{background:var(--panel)}
+  .trow .tn{font-family:var(--mono);font-size:12px;color:var(--accent2);flex:0 0 auto}
+  .trow .td{font-size:11.5px;color:var(--muted);line-height:1.45;min-width:0}
+  .trow.off{opacity:.5}
+  .trow.off .tn{color:var(--muted);text-decoration:line-through}
+  .trow .off-tag{font-size:10px;color:var(--muted);font-family:var(--mono);border:1px solid var(--border);border-radius:10px;padding:0 6px;flex:0 0 auto}
+  .mcpempty{color:var(--muted);font-size:13px;text-align:center;padding:26px 10px;line-height:1.6}
+  .mcpempty code{font-family:var(--mono);color:var(--accent2)}
+  /* Skills panel — shares the MCP modal shell, differs only in body layout */
+  #skillsmodal{display:none;position:fixed;inset:0;background:var(--overlay);z-index:80;
+    align-items:center;justify-content:center;padding:20px}
+  #skillsmodal.show{display:flex}
+  #skillsmodal .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+    width:min(96vw,720px);max-height:86vh;display:flex;flex-direction:column;box-shadow:0 18px 50px var(--shadow)}
+  #skillsmodal .head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+  #skillsmodal .head h2{margin:0;font-size:15px;flex:1}
+  #skillsmodal .head .sub{color:var(--muted);font-size:11px;font-family:var(--mono);font-weight:400;display:block;margin-top:3px}
+  #skillsmodal .head button{background:var(--panel2);border:1px solid var(--border);color:var(--text);
+    border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+  #skillsmodal .head button:hover{border-color:var(--accent)}
+  #skillsfilter{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;
+    color:var(--text);padding:8px 11px;font-size:13px;outline:none;font-family:var(--sans);margin-bottom:12px}
+  #skillsfilter:focus{border-color:var(--accent)}
+  #skillsmodal .bd{overflow-y:auto;padding:14px 18px 18px}
+  .skcat{margin-bottom:14px}
+  .skcat h4{margin:0 0 7px;font-size:11px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.7px;font-weight:600;border-bottom:1px solid var(--border);padding-bottom:4px}
+  .skgrid{display:flex;flex-wrap:wrap;gap:6px}
+  .skill{font-family:var(--mono);font-size:12px;color:var(--accent2);background:var(--panel2);
+    border:1px solid var(--border);border-radius:6px;padding:4px 9px;white-space:nowrap}
+  .skill.local{border-color:var(--accent);color:var(--accent2)}
+  .skill .src{color:var(--dim);font-size:10px;margin-left:5px}
+  .sknote{color:var(--muted);font-size:11.5px;line-height:1.55;padding:2px 0 10px}
+  .tool.mcp{border-left-color:var(--info);color:var(--info-text)}
+  .tool.err{border-left-color:var(--red);color:var(--red-text)}
+
+  ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:var(--hover);border-radius:5px}
+
+  .queuebar{max-width:820px;margin:0 auto 6px;padding:7px 12px;border-radius:8px;background:var(--accent-soft2);
     border:1px solid var(--accent);color:var(--accent2);font-size:12px;font-family:var(--mono);
     display:flex;align-items:center;gap:10px}
   .queuebar #queuetext{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -128,7 +280,7 @@
   .queuebar button:hover{color:var(--text)}
 
   .slashmenu{position:absolute;bottom:100%;left:0;right:0;margin-bottom:6px;background:var(--panel2);
-    border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px rgba(0,0,0,.5);z-index:20}
+    border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px var(--shadow);z-index:20}
   .slashmenu .item{padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px}
   .slashmenu .item:hover,.slashmenu .item.sel{background:var(--panel)}
   .slashmenu .item b{color:var(--accent2);font-family:var(--mono)}
@@ -143,18 +295,18 @@
   #lock input{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;color:var(--text);
     padding:11px 12px;font-size:16px;outline:none;margin-bottom:10px;font-family:var(--mono)}
   #lock input:focus{border-color:var(--accent)}
-  #lock button{width:100%;padding:11px;background:var(--accent);color:#111;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:14px}
+  #lock button{width:100%;padding:11px;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:14px}
   #lock .err{color:var(--red);font-size:12px;min-height:16px;margin-top:8px}
 
   /* Hamburger + drawer backdrop (mobile only) */
   #menubtn{display:none;background:none;border:none;color:var(--text);font-size:22px;line-height:1;cursor:pointer;padding:2px 6px;margin-right:2px}
-  #backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:30}
+  #backdrop{display:none;position:fixed;inset:0;background:var(--overlay);z-index:30}
 
   /* ── Mobile layout ──────────────────────────────── */
   @media (max-width:720px){
     #menubtn{display:block}
     #sidebar{position:fixed;top:0;left:0;bottom:0;width:82vw;max-width:320px;flex-basis:auto;
-      z-index:40;transform:translateX(-100%);transition:transform .22s ease;box-shadow:0 0 34px rgba(0,0,0,.6)}
+      z-index:40;transform:translateX(-100%);transition:transform .22s ease;box-shadow:0 0 34px var(--shadow)}
     #sidebar.open{transform:translateX(0)}
     #backdrop.show{display:block}
     #main{width:100%;min-width:0}
@@ -189,6 +341,34 @@
       <div class="err" id="lockerr"></div>
     </div>
   </div>
+  <div id="mcpmodal">
+    <div class="card">
+      <div class="head">
+        <h2>⚹ MCP servers
+          <span class="sub" id="mcpsub">—</span>
+        </h2>
+        <button id="mcprecheck" title="Re-run the connection test for every server">↻ Re-check</button>
+        <button id="mcpclose" title="Close">✕</button>
+      </div>
+      <div class="bd" id="mcpbody"></div>
+    </div>
+  </div>
+  <div id="skillsmodal">
+    <div class="card">
+      <div class="head">
+        <h2>🎓 Skills
+          <span class="sub" id="skillssub">—</span>
+        </h2>
+        <button id="skillsrefresh" title="Re-read the agent's enabled skill list">↻ Refresh</button>
+        <button id="skillsclose" title="Close">✕</button>
+      </div>
+      <div class="bd">
+        <div class="sknote" id="skillsnote"></div>
+        <input id="skillsfilter" type="search" placeholder="Filter skills…" autocomplete="off" />
+        <div id="skillsbody"></div>
+      </div>
+    </div>
+  </div>
   <div id="backdrop"></div>
   <aside id="sidebar">
     <div id="brand">
@@ -206,6 +386,13 @@
       <span class="k">chat</span><span class="v" id="cursession">—</span>
       <span style="flex:1"></span>
       <span class="k">ctx</span><span class="v" id="ctxmeter" title="">—</span>
+      <button id="mcpbtn" title="MCP servers — click to inspect health and tools">
+        <span class="dot"></span><span id="mcptext">MCP —</span>
+      </button>
+      <button id="skillsbtn" title="Skills the agent loaded — click to list them">
+        <span id="skillstext">Skills —</span>
+      </button>
+      <button id="themebtn" title="Switch theme">☾</button>
       <span class="k">container</span><span class="v" id="containername">hermes-agent</span>
     </div>
     <div id="chat"><div class="wrap" id="messages"></div></div>
@@ -507,9 +694,42 @@ function toolHtml(t){
   const m = t.match(/^(\d{2}:\d{2}:\d{2})\s+([\s\S]*)$/);
   const time = m ? m[1] : "";
   const body = m ? m[2] : t;
-  const cls = body.startsWith("●") ? "tool call" : body.startsWith("↳") ? "tool result"
+  const cls = body.startsWith("●") ? "tool call"
+    : body.startsWith("⚹") ? "tool mcp"
+    : body.startsWith("⛔") ? "tool err"
+    : body.startsWith("↳") ? "tool result"
     : body.startsWith("⚠️") ? "tool switch" : "tool";
   return `<div class="${cls}">${time?`<span class="ts">${time}</span> `:""}${esc(body)}</div>`;
+}
+
+/* ---------- MCP calls in the transcript ----------
+   Hermes registers MCP tools as `mcp__<server>__<tool>`, which is unreadable
+   inline and hides WHICH server an action went to. These render them as
+   `⚹ server › tool` (blue), so an external side effect — a ClickUp task being
+   created, say — is never mistaken for a local builtin, and a failure can be
+   traced to a specific server in the MCP panel. Both the live SSE path and the
+   reattach/replay path build their lines here so a recovered transcript looks
+   identical to a live one. */
+function mcpParts(name){
+  const m=/^mcp__(.+?)__(.+)$/.exec(String(name||""));
+  return m ? {server:m[1], tool:m[2]} : null;
+}
+function callLine(d){
+  const p=mcpParts(d.name);
+  const label = p ? `⚹ ${p.server} › ${p.tool}` : `● ${d.name||"?"}`;
+  return `${fmtClock(d.ts)}  ${label}${d.args?" "+d.args:""}`;
+}
+function callStatus(d){
+  const p=mcpParts(d.name);
+  return p ? `Calling ${p.server} › ${p.tool}` : `Running tool: ${d.name||"?"}`;
+}
+// Only applied to the result of an MCP call — these words are far too common
+// in ordinary tool output (grep hits, logs, source code) to flag globally.
+const MCP_AUTH_RE=/(\b401\b|\b403\b|unauthorized|forbidden|oauth token not found|invalid[ _-]?(api[ _-]?)?(key|token)|authentication failed|missing required environment)/i;
+function resultLine(d, afterMcp){
+  const txt=d.text||"";
+  const bad = afterMcp && MCP_AUTH_RE.test(txt);
+  return {line:`${fmtClock(d.ts)}  ${bad?"⛔":"↳"} ${txt}`, authFail:bad};
 }
 function switchLine(from, to, ts){
   return `${fmtClock(ts)}  ⚠️ ${from} was rate-limited — continued on ${to}`;
@@ -720,6 +940,8 @@ async function send(arg){
   let interrupted=false, stopped=false;
   let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
+  let lastCallMcp=false;        // was the tool that produced the next result an MCP one?
+  let mcpAuthToasted=false;     // warn about a rejected MCP call once per turn
   function repaint(){
     const b=ensureBubble(); if(!b) return;   // conversation isn't on screen — storage-only for now
     let html="";
@@ -763,9 +985,26 @@ async function send(arg){
         } else if(ev.event==="tool"){
           // Live agent activity, Claude-code style: commands, their output,
           // and finished sub-step messages — each stamped with its time.
-          const d=ev.data||{}; const t=fmtClock(d.ts);
-          if(d.kind==="call"){ toolLines.push(`${t}  ● ${d.name}${d.args?" "+d.args:""}`); status=`Running tool: ${d.name}`; }
-          else if(d.kind==="result"){ toolLines.push(`${t}  ↳ ${d.text||""}`); status="Processing result…"; }
+          const d=ev.data||{};
+          if(d.kind==="call"){
+            toolLines.push(callLine(d));
+            lastCallMcp=!!mcpParts(d.name);
+            status=callStatus(d);
+          }
+          else if(d.kind==="result"){
+            const r=resultLine(d, lastCallMcp);
+            toolLines.push(r.line);
+            status="Processing result…";
+            // An MCP call that came back 401/403 is the single most likely
+            // failure here (expired or unset API key) and the agent tends to
+            // narrate around it rather than say so. Surface it directly and
+            // re-probe so the chip/panel stop claiming the server is fine.
+            if(r.authFail && !mcpAuthToasted){
+              mcpAuthToasted=true;
+              toast("⛔ MCP call rejected — check credentials in the MCP panel");
+              fetchMcp(true);
+            }
+          }
           else if(d.kind==="interim" && d.text){
             finalText += (finalText?"\n\n":"") + d.text;
             status="Generating…";
@@ -981,6 +1220,288 @@ document.addEventListener("click", closeModelMenu);
 renderModelBtn();
 fetchModels();
 
+/* ---------- theme ----------
+   The palette is entirely CSS tokens keyed off <html data-theme>; this only
+   flips the attribute. The initial value is already set by the inline script
+   in <head> (before first paint), so this never has to guess on load — it just
+   keeps the button label and the mobile address-bar colour in sync. */
+const THEME_LS="hermes_theme";
+function applyTheme(t){
+  document.documentElement.setAttribute("data-theme", t);
+  try{ localStorage.setItem(THEME_LS, t); }catch(e){}
+  const btn=$("#themebtn");
+  if(btn){
+    btn.textContent = t==="dark" ? "☾" : "☀";
+    btn.title = t==="dark" ? "Dark roast — switch to the light crema theme"
+                           : "Light crema — switch to the dark roast theme";
+  }
+  // Keep the mobile browser chrome matching the page instead of stranding a
+  // dark address bar above a cream UI.
+  const meta=document.querySelector('meta[name="theme-color"]');
+  if(meta) meta.setAttribute("content",
+    getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() || "#16110d");
+}
+$("#themebtn").onclick=()=>{
+  applyTheme(document.documentElement.getAttribute("data-theme")==="dark" ? "light" : "dark");
+};
+
+/* ---------- MCP servers: health + tool discovery ----------
+   Hermes loads MCP servers from `mcp_servers` in ~/.hermes/config.yaml and
+   hands their tools to the agent as `mcp__<server>__<tool>`. Until now that was
+   completely invisible here: a server could be misconfigured, unreachable, or
+   holding a dead API key and the only symptom would be the agent quietly
+   failing mid-turn. /api/mcp probes each server (`hermes mcp test`) and reports
+   three things this UI keeps separate on purpose:
+     connected      — the process/endpoint answered and listed its tools
+     credentials    — whether every ${VAR} the server needs actually resolves
+     selected tools — what survives the server's tools.include/exclude filter
+   "Connected but no credentials" is a real and confusing state — Hermes leaves
+   an unset ${VAR} as a literal placeholder, so the server starts happily and
+   advertises everything, then every call 401s. That shows as amber, not green. */
+const MCP_STATE_META = {
+  ok:            {cls:"ok",   badge:"connected"},
+  auth_required: {cls:"warn", badge:"auth required"},
+  unreachable:   {cls:"bad",  badge:"unreachable"},
+};
+let mcpInfo=null, mcpLoading=false, mcpWarned=false;
+
+async function fetchMcp(refresh){
+  if(mcpLoading) return;
+  mcpLoading=true; renderMcpBtn();
+  try{
+    const r=await fetch("/api/mcp"+(refresh?"?refresh=1":""));
+    mcpInfo=await r.json();
+    // Announce a problem once per page load, so a broken server is noticed
+    // without having to open the panel first.
+    const s=mcpInfo.summary||{};
+    if(!mcpWarned && (s.auth_required||s.unreachable)){
+      mcpWarned=true;
+      const bits=[];
+      if(s.unreachable) bits.push(`${s.unreachable} unreachable`);
+      if(s.auth_required) bits.push(`${s.auth_required} needing credentials`);
+      toast(`⚹ MCP: ${bits.join(", ")} — click the MCP chip for details`);
+    }
+  }catch(e){ /* backend offline */ }
+  finally{
+    mcpLoading=false; renderMcpBtn();
+    if($("#mcpmodal").classList.contains("show")) renderMcpPanel();
+  }
+}
+
+function renderMcpBtn(){
+  const btn=$("#mcpbtn"), dot=btn.querySelector(".dot"), txt=$("#mcptext");
+  dot.className="dot";
+  btn.classList.remove("hasissue");
+  if(mcpLoading && !mcpInfo){ txt.textContent="MCP …"; btn.title="Probing MCP servers…"; return; }
+  if(!mcpInfo){ txt.textContent="MCP —"; btn.title="MCP status unavailable (backend offline?)"; return; }
+  const s=mcpInfo.summary||{total:0,ok:0};
+  if(!s.total){
+    txt.textContent="MCP 0";
+    btn.title="No MCP servers configured. Add one under `mcp_servers:` in ~/.hermes/config.yaml.";
+    return;
+  }
+  txt.textContent=`MCP ${s.ok}/${s.total}`;
+  if(s.unreachable){ dot.classList.add("bad"); btn.classList.add("hasissue"); }
+  else if(s.auth_required){ dot.classList.add("warn"); btn.classList.add("hasissue"); }
+  else dot.classList.add("ok");
+  const lines=(mcpInfo.servers||[]).map(sv=>`${sv.name}: ${(MCP_STATE_META[sv.state]||{}).badge||sv.state}`);
+  btn.title=`${s.ok}/${s.total} MCP servers healthy · ${s.tools||0} tools offered to the agent\n`
+    +lines.join("\n")+"\nClick to inspect.";
+}
+
+function renderMcpPanel(){
+  const body=$("#mcpbody"), sub=$("#mcpsub");
+  if(!mcpInfo){
+    sub.textContent="unavailable";
+    body.innerHTML=`<div class="mcpempty">Could not reach the backend to read MCP status.</div>`;
+    return;
+  }
+  const s=mcpInfo.summary||{total:0};
+  const when=mcpInfo.checked_at?fmtClock(mcpInfo.checked_at*1000):"";
+  sub.textContent=`${s.total} configured · ${s.ok||0} healthy · ${s.tools||0} tools offered to the agent${when?" · checked "+when:""}`;
+
+  if(mcpInfo.config_error){
+    body.innerHTML=`<div class="mcpempty">Could not read config.yaml:<br><code>${esc(mcpInfo.config_error)}</code></div>`;
+    return;
+  }
+  if(!(mcpInfo.servers||[]).length){
+    body.innerHTML=`<div class="mcpempty">No MCP servers configured.<br><br>
+      Add one under <code>mcp_servers:</code> in <code>~/.hermes/config.yaml</code>,
+      then hit Re-check.</div>`;
+    return;
+  }
+
+  body.innerHTML=(mcpInfo.servers||[]).map(sv=>{
+    const meta=MCP_STATE_META[sv.state]||{cls:"bad",badge:sv.state||"unknown"};
+    const sel=new Set(sv.selected_tools||[]);
+    const tools=(sv.tools||[]);
+
+    const envHtml=(sv.env_refs||[]).length ? `
+      <div class="mcpsec">
+        <h4>Credentials</h4>
+        ${(sv.env_refs||[]).map(k=>{
+          const missing=(sv.missing_env||[]).includes(k);
+          return `<div class="envrow"><span class="${missing?"miss":"have"}">${missing?"✗":"✓"}</span>
+            <span>${esc(k)}</span>
+            <span style="color:var(--muted)">${missing?"not set — placeholder passed through literally":"resolved"}</span></div>`;
+        }).join("")}
+      </div>` : "";
+
+    const toolsHtml=tools.length ? `
+      <div class="mcpsec">
+        <h4>Tools discovered — ${tools.length} on the server, ${sel.size} offered to the agent</h4>
+        <div class="tlist">
+          ${tools.map(t=>{
+            const on=sel.has(t.name);
+            return `<div class="trow${on?"":" off"}" title="${on?esc("mcp__"+sv.name+"__"+t.name):"filtered out by tools.include / tools.exclude"}">
+              <span class="tn">${esc(t.name)}</span>
+              ${on?"":`<span class="off-tag">not enabled</span>`}
+              <span class="td">${esc(t.description||"")}</span>
+            </div>`;
+          }).join("")}
+        </div>
+      </div>` : `
+      <div class="mcpsec"><h4>Tools discovered</h4>
+        <div class="envrow" style="color:var(--muted)">none — the server never got far enough to list them</div>
+      </div>`;
+
+    return `<div class="mcpsrv">
+      <div class="row1">
+        <span class="nm">${esc(sv.name)}</span>
+        <span class="badge ${meta.cls}">${esc(meta.badge)}</span>
+        ${sv.connect_ms?`<span style="color:var(--muted);font-family:var(--mono);font-size:11px">${sv.connect_ms}ms</span>`:""}
+      </div>
+      <div class="tgt">${esc(sv.transport||"?")} · ${esc(sv.target||"?")}</div>
+      <div class="detail ${meta.cls}">${esc(sv.detail||"")}</div>
+      ${envHtml}
+      ${toolsHtml}
+    </div>`;
+  }).join("")
+  + `<div class="mcpempty" style="padding:6px 2px 0;font-size:11.5px;text-align:left">
+       The agent sees these as <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>; calls to them appear
+       in blue in the transcript.</div>`;
+}
+
+function openMcpPanel(){
+  $("#mcpmodal").classList.add("show");
+  renderMcpPanel();
+  if(!mcpInfo) fetchMcp();
+}
+function closeMcpPanel(){ $("#mcpmodal").classList.remove("show"); }
+$("#mcpbtn").onclick=(e)=>{ e.stopPropagation(); openMcpPanel(); };
+$("#mcpclose").onclick=closeMcpPanel;
+$("#mcpmodal").onclick=(e)=>{ if(e.target===$("#mcpmodal")) closeMcpPanel(); };
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeMcpPanel(); });
+$("#mcprecheck").onclick=async()=>{
+  const b=$("#mcprecheck"); b.disabled=true; b.textContent="↻ Checking…";
+  $("#mcpbody").innerHTML=`<div class="mcpempty">Probing each server — a dead one takes until its connect_timeout…</div>`;
+  await fetchMcp(true);
+  b.disabled=false; b.textContent="↻ Re-check";
+  renderMcpPanel();
+};
+
+/* ---------- skills: what the agent can currently do ----------
+   Hermes puts a skills INDEX (name + one-liner) in every system prompt and
+   only reads a SKILL.md body when the model actually invokes one. This panel
+   sits on the index side of that line: it lists names, never bodies, so
+   answering "what does it know how to do?" costs no context and no disk reads.
+   The context figure shown comes from /api/context's existing breakdown, so
+   opening this panel adds no work on the agent side at all. */
+let skillsInfo=null, skillsLoading=false, skillsFilter="";
+
+async function fetchSkills(refresh){
+  if(skillsLoading) return;
+  skillsLoading=true; renderSkillsBtn();
+  try{
+    const r=await fetch("/api/skills"+(refresh?"?refresh=1":""));
+    skillsInfo=await r.json();
+  }catch(e){ /* backend offline */ }
+  finally{
+    skillsLoading=false; renderSkillsBtn();
+    if($("#skillsmodal").classList.contains("show")) renderSkillsPanel();
+  }
+}
+
+function renderSkillsBtn(){
+  const btn=$("#skillsbtn"), txt=$("#skillstext");
+  if(skillsLoading && !skillsInfo){ txt.textContent="Skills …"; btn.title="Reading the agent's skill list…"; return; }
+  if(!skillsInfo || skillsInfo.error){
+    txt.textContent="Skills —";
+    btn.title=skillsInfo&&skillsInfo.error ? "Could not read skills: "+skillsInfo.error
+                                           : "Skill list unavailable (backend offline?)";
+    return;
+  }
+  txt.textContent=`Skills ${skillsInfo.total}`;
+  const cats=Object.keys(skillsInfo.categories||{}).length;
+  btn.title=`${skillsInfo.total} skills enabled for the next turn, across ${cats} categories\n`
+    +`Names only — SKILL.md bodies load on demand, not now.\nClick to browse.`;
+}
+
+function renderSkillsPanel(){
+  const body=$("#skillsbody"), sub=$("#skillssub"), note=$("#skillsnote");
+  if(!skillsInfo){
+    sub.textContent="unavailable";
+    body.innerHTML=`<div class="mcpempty">Could not reach the backend to read the skill list.</div>`;
+    return;
+  }
+  if(skillsInfo.error && !skillsInfo.total){
+    sub.textContent="error";
+    body.innerHTML=`<div class="mcpempty">Could not read the skill list:<br><code>${esc(skillsInfo.error)}</code></div>`;
+    return;
+  }
+  const when=skillsInfo.checked_at?fmtClock(skillsInfo.checked_at*1000):"";
+  const srcs=Object.entries(skillsInfo.sources||{}).map(([k,v])=>`${v} ${k}`).join(" · ");
+  sub.textContent=`${skillsInfo.total} enabled · ${srcs}${when?" · read "+when:""}`;
+
+  // The index cost is already known from /api/context — reuse it rather than
+  // making the agent recompute anything just to render this panel.
+  const idx=ctxInfo&&ctxInfo.breakdown?ctxInfo.breakdown.skills_index_chars:0;
+  note.innerHTML=`These are the skills loaded for the next turn. Only their <em>names and
+    one-line descriptions</em> sit in the prompt${idx?` (~${fmtK(Math.round(idx/4))} tokens)`:""};
+    a skill's full <code>SKILL.md</code> is read only when the agent actually invokes it —
+    nothing here opens one.`;
+
+  const q=skillsFilter.trim().toLowerCase();
+  const list=(skillsInfo.skills||[]).filter(s=>!q || s.name.toLowerCase().includes(q) || (s.category||"").toLowerCase().includes(q));
+  if(!list.length){
+    body.innerHTML=`<div class="mcpempty">No skill matches “${esc(skillsFilter)}”.</div>`;
+    return;
+  }
+  const byCat=new Map();
+  list.forEach(s=>{
+    if(!byCat.has(s.category)) byCat.set(s.category, []);
+    byCat.get(s.category).push(s);
+  });
+  body.innerHTML=[...byCat.entries()].map(([cat, items])=>`
+    <div class="skcat">
+      <h4>${esc(cat)} — ${items.length}</h4>
+      <div class="skgrid">
+        ${items.map(s=>`<span class="skill${s.source!=="builtin"?" local":""}"
+          title="${esc(s.name)} · ${esc(s.source)} · trust: ${esc(s.trust)} · ${esc(s.status)}"
+          >${esc(s.name)}${s.source!=="builtin"?`<span class="src">${esc(s.source)}</span>`:""}</span>`).join("")}
+      </div>
+    </div>`).join("");
+}
+
+function openSkillsPanel(){
+  $("#skillsmodal").classList.add("show");
+  renderSkillsPanel();
+  if(!skillsInfo) fetchSkills();
+  setTimeout(()=>$("#skillsfilter").focus(), 30);
+}
+function closeSkillsPanel(){ $("#skillsmodal").classList.remove("show"); }
+$("#skillsbtn").onclick=(e)=>{ e.stopPropagation(); openSkillsPanel(); };
+$("#skillsclose").onclick=closeSkillsPanel;
+$("#skillsmodal").onclick=(e)=>{ if(e.target===$("#skillsmodal")) closeSkillsPanel(); };
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeSkillsPanel(); });
+$("#skillsfilter").addEventListener("input",e=>{ skillsFilter=e.target.value; renderSkillsPanel(); });
+$("#skillsrefresh").onclick=async()=>{
+  const b=$("#skillsrefresh"); b.disabled=true; b.textContent="↻ Reading…";
+  await fetchSkills(true);
+  b.disabled=false; b.textContent="↻ Refresh";
+  renderSkillsPanel();
+};
+
 /* ---------- wiring ---------- */
 // The composer reads its own box, decides slash-command vs. plain message,
 // and — for a plain message — always sends against the ACTIVE conversation.
@@ -1061,10 +1582,10 @@ function clearPending(id){ const p=getPending(); delete p[id]; writeJSON(PENDING
 
 function rebuildFromRecord(j){
   const tools=[]; const interims=[];
+  let lastCallMcp=false;   // mirrors send()'s live pass so replays render alike
   (j.events||[]).forEach(d=>{
-    const t=fmtClock(d.ts);
-    if(d.kind==="call") tools.push(`${t}  ● ${d.name}${d.args?" "+d.args:""}`);
-    else if(d.kind==="result") tools.push(`${t}  ↳ ${d.text||""}`);
+    if(d.kind==="call"){ tools.push(callLine(d)); lastCallMcp=!!mcpParts(d.name); }
+    else if(d.kind==="result") tools.push(resultLine(d, lastCallMcp).line);
     else if(d.kind==="interim" && d.text) interims.push(d.text);
     else if(d.kind==="model_switch") tools.push(switchLine(d.from, d.to, d.ts));
     // "chunk" events are the final reply — covered by j.text
@@ -1137,10 +1658,17 @@ window.addEventListener("pageshow", recoverAllPending);
   messages = loadMsgs(activeId);
   $("#cursession").textContent = convoTitle(activeId) || "New chat";
   renderConvos(); renderConversation(); health(); fetchContext(); syncComposerUI(); updateQueueBar(); input.focus();
+  applyTheme(document.documentElement.getAttribute("data-theme") || "dark");
+  renderMcpBtn(); fetchMcp();
+  renderSkillsBtn(); fetchSkills();
   recoverAllPending();   // pick up every conversation's reply interrupted before this load
 })();
 setInterval(health,15000);
 setInterval(fetchContext,300000);   // refresh the fixed prompt budget every 5 min
+// MCP probing spawns `hermes mcp test` per server (seconds each, and a dead one
+// blocks until its connect_timeout), so this polls slowly — the backend caches
+// for 60s anyway, and Re-check in the panel is there for an answer on demand.
+setInterval(()=>fetchMcp(),300000);
 </script>
 </body>
 </html>
