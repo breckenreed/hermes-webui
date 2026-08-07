@@ -262,6 +262,46 @@ connection state and connect time, which `${VAR}` credentials resolve, and every
 tool the server advertises — marking which ones survive the server's
 `tools.include`/`tools.exclude` filter and are actually offered to the agent.
 
+### When a server won't start
+
+A stdio MCP server is spawned through a parent-death watchdog, and that wrapper
+turns a failed launch into a **closed pipe** rather than an error the client can
+describe. Hermes' own `missing executable` message can therefore never fire, and
+the panel used to show a bare *"Connection closed"* with nothing to act on. Three
+things now close that gap:
+
+- **Missing-command preflight.** Before running the connection test, the backend
+  checks that the server's `command` actually resolves inside the agent
+  container. If it doesn't, the state is **"not installed"** — its own state, not
+  a flavour of *unreachable*, because the fix is different — reported in about a
+  second instead of burning the full `connect_timeout`. Nearly always this means
+  a stale image: `docker compose up -d` reuses the existing one, so a server
+  added to the Dockerfile after the last `--build` was never installed.
+- **Server stderr.** Hermes writes each stdio server's output to
+  `~/.hermes/logs/mcp-stderr.log`, tagged per launch. When a server is failing,
+  the panel shows that launch's tail — for a masked `ENOENT` it is the only
+  record of the real traceback anywhere in the system.
+- **One retry on transient errors.** "Connection closed"/timeout-shaped failures
+  are retried once, so a startup race doesn't paint the panel red. A genuine
+  misconfiguration fails identically twice and still reports.
+
+### Auto-recovery
+
+Hermes only reconnects a dead stdio server on its own when it considers that
+server *recycled stdio*, and that requires an idle or lifetime limit to be
+configured. With neither set — the default — a server that dies mid-run stays
+dead for the rest of that `hermes -z` process, and every later tool call fails
+against a corpse. The panel now states this per server, and it is armed with:
+
+```yaml
+mcp_servers:
+  your_server:
+    keepalive_interval: 60       # notice a dropped pipe promptly (floored at 5s)
+    idle_timeout_seconds: 1800   # recycle after 30m idle; next call respawns it
+    max_lifetime_seconds: 43200  # hard ceiling regardless of traffic
+```
+
+
 Health deliberately distinguishes three states rather than up/down:
 
 | State | Meaning |

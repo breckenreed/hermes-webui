@@ -23,6 +23,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 from pathlib import Path
 
@@ -892,6 +893,178 @@ async def _container_env_names() -> set[str] | None:
         return None
 
 
+# Errors that mean "try again", not "this is broken". A stdio server that lost a
+# startup race, or a network MCP that blipped, reports one of these; a genuinely
+# misconfigured one reports the same thing every time. Retried once (see
+# _probe_mcp_server) so a transient blip doesn't paint the panel red.
+MCP_TRANSIENT_HINTS = (
+    "connection closed", "timed out", "timeout", "broken pipe",
+    "connection reset", "temporarily unavailable", "econnrefused",
+)
+
+
+async def _stdio_command_exists(cfg: dict) -> bool | None:
+    """Can the container actually execute this server's stdio command?
+
+    This is the check whose absence cost a day of debugging. Hermes wraps every
+    POSIX stdio server in mcp_stdio_watchdog.py (tools/mcp_tool.py:
+    _wrap_command_with_watchdog), so the wrapper — python, which always exists —
+    is what gets spawned. When the REAL command is missing, the wrapper starts
+    fine, dies of FileNotFoundError, and the MCP client sees nothing but a closed
+    pipe. Hermes' own _format_connect_error() has a good "missing executable"
+    message, but it can never fire here because no ENOENT ever reaches it: the
+    user-visible result is a bare "Connection closed".
+
+    Returns True/False, or None when the check itself couldn't run (don't
+    downgrade a server's state off a failed probe).
+    """
+    command = str(cfg.get("command") or "").strip()
+    if not command:
+        return None
+    try:
+        # `command -v` resolves PATH and shell builtins the same way the spawn
+        # will. An absolute path is checked as a file instead, since `command -v`
+        # on a path only tests executability, which is the same question.
+        code, _ = await asyncio.wait_for(
+            _run(*_exec_prefix(), "sh", "-lc", f"command -v {shlex.quote(command)}"),
+            timeout=20)
+        return code == 0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Hermes writes every stdio server's stderr to ~/.hermes/logs/mcp-stderr.log,
+# prefixing each launch with `===== [ts] starting MCP server '<name>' =====`
+# (tools/mcp_tool.py: _write_stderr_log_header). That file is the ONLY place the
+# real cause of a failed stdio launch exists — see _stdio_command_exists above.
+MCP_STDERR_LOG = "/opt/data/logs/mcp-stderr.log"
+_MCP_STDERR_HEADER_RE = re.compile(
+    r"^=+\s*\[(?P<ts>[^\]]+)\]\s*starting MCP server '(?P<name>[^']+)'\s*=+\s*$")
+
+
+def _last_stderr_block(log: str, name: str, max_lines: int = 14) -> str:
+    """Last launch block for `name` from mcp-stderr.log, trimmed to max_lines.
+
+    Blocks run from one header to the next header for ANY server, so a busy
+    multi-server log can't bleed another server's output into this one.
+    """
+    lines = log.splitlines()
+    start = -1
+    for i, line in enumerate(lines):
+        m = _MCP_STDERR_HEADER_RE.match(line.strip())
+        if m and m.group("name") == name:
+            start = i
+    if start < 0:
+        return ""
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if _MCP_STDERR_HEADER_RE.match(lines[j].strip()):
+            end = j
+            break
+    body = [ln for ln in lines[start + 1:end] if ln.strip()]
+    if not body:
+        return ""
+    # The tail carries the exception; the head is usually framework noise.
+    return "\n".join(body[-max_lines:])
+
+
+async def _mcp_stderr_tail(name: str) -> str:
+    try:
+        out = await _run_out(*_exec_prefix(), "tail", "-n", "400", MCP_STDERR_LOG, timeout=20)
+        return _last_stderr_block(out, name)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# Hermes caches each connected server's real tool schemas here (written by
+# tools/mcp_schema_cache.py at connect time). This is the ONLY source of full
+# tool metadata available to the webui: `hermes mcp test` renders a console
+# table whose descriptions it truncates to 55 chars (hermes_cli/mcp_config.py:
+# cmd_mcp_test), after _probe_single_server has already cut them to 80 — so a
+# description parsed from that output is a fragment with no way to recover the
+# rest. The cache holds the untruncated text plus each tool's inputSchema,
+# which is where a consolidated tool's `action` enum lives (manage_task →
+# create/update/delete/move/duplicate). That enum is the thing worth reading
+# before writing a prompt, so it's surfaced explicitly rather than left buried.
+MCP_SCHEMA_CACHE = "/opt/data/cache/mcp_schema_cache.json"
+
+
+def _tool_schema_facts(entry: dict) -> dict:
+    """Pull the useful bits out of one cached tool schema."""
+    schema = entry.get("inputSchema") or entry.get("input_schema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    required = [str(r) for r in required] if isinstance(required, list) else []
+
+    # The action/operation enum a consolidated tool routes on. Servers name it
+    # differently, so check the conventional keys in order of likelihood.
+    actions: list[str] = []
+    for key in ("action", "operation", "mode", "command"):
+        spec = props.get(key)
+        if isinstance(spec, dict) and isinstance(spec.get("enum"), list):
+            actions = [str(v) for v in spec["enum"]]
+            break
+
+    return {
+        "full_description": str(entry.get("description") or ""),
+        "actions": actions,
+        "required_params": [p for p in required if p in props] or required,
+        "params": sorted(props.keys()),
+    }
+
+
+async def _mcp_schema_cache() -> dict:
+    """{server: {tool: {full_description, actions, params, ...}}} or {}."""
+    try:
+        out = await _run_out(*_exec_prefix(), "cat", MCP_SCHEMA_CACHE, timeout=20)
+        raw = json.loads(out[out.index("{"):])
+    except Exception:  # noqa: BLE001
+        return {}
+    cache: dict = {}
+    for server, block in (raw.items() if isinstance(raw, dict) else []):
+        if not isinstance(block, dict):
+            continue
+        tools: dict = {}
+        # `utility_tools` holds the resources/prompts helpers Hermes registers
+        # alongside the server's own tools; both are real, callable tools.
+        for group in ("tools", "utility_tools"):
+            for entry in (block.get(group) or []):
+                if isinstance(entry, dict) and entry.get("name"):
+                    tools[str(entry["name"])] = _tool_schema_facts(entry)
+        cache[server] = tools
+    return cache
+
+
+def _recycle_settings(cfg: dict) -> dict:
+    """Whether Hermes' stdio auto-recycle / lazy-reconnect is armed for a server.
+
+    Hermes only reconnects a dead stdio server on its own when it considers that
+    server "recycled stdio" (_is_recycled_stdio), and that requires an idle or
+    lifetime limit to be configured. Without one, a server that dies mid-run
+    stays dead for the rest of that `hermes -z` process. Reported so the panel
+    can say so rather than leaving it invisible.
+    """
+    lifecycle = cfg.get("lifecycle") if isinstance(cfg.get("lifecycle"), dict) else {}
+
+    def _num(key: str):
+        raw = cfg.get(key, lifecycle.get(key))
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
+
+    idle, lifetime, keepalive = _num("idle_timeout_seconds"), _num("max_lifetime_seconds"), _num("keepalive_interval")
+    return {
+        "idle_timeout_seconds": idle,
+        "max_lifetime_seconds": lifetime,
+        "keepalive_interval": keepalive,
+        # HTTP servers reconnect per request; the recycle flag is stdio-only.
+        "auto_reconnect": bool(idle or lifetime),
+    }
+
+
 def _mcp_env_refs(cfg: dict) -> list[str]:
     """Every ${VAR} referenced by a server's env values / HTTP headers."""
     refs: list[str] = []
@@ -953,10 +1126,15 @@ def _selected_tool_names(cfg: dict, discovered: list[dict]) -> list[str]:
     return names
 
 
-async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) -> dict:
+async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None,
+                            schemas: dict | None = None) -> dict:
     """Config + live health for one MCP server.
 
     States, in the order they're decided:
+      missing_binary — a stdio server whose command doesn't exist in the
+                      container. Decided FIRST and without running the
+                      connection test, because that test would spend the whole
+                      connect_timeout to arrive at a bare "Connection closed".
       auth_required — a ${VAR} the server needs is unset, OR the connection
                       failed with an auth-shaped error. The server may well be
                       reachable and advertising tools; it just can't authenticate.
@@ -982,26 +1160,69 @@ async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) ->
         connect_timeout = 60.0
     budget = max(30.0, min(connect_timeout + 25.0, 200.0))
 
+    recycle = _recycle_settings(cfg)
     result = {"connected": False, "connect_ms": 0, "error": "", "tools": [], "tool_count": 0}
-    try:
-        _, out = await asyncio.wait_for(
-            _run(*_exec_prefix(), "hermes", "mcp", "test", name), timeout=budget)
-        result = _parse_mcp_test(out)
-    except asyncio.TimeoutError:
-        result["error"] = f"health check exceeded {int(budget)}s"
-    except Exception as e:  # noqa: BLE001
-        result["error"] = str(e)
+    stderr_tail = ""
 
-    err_l = (result["error"] or "").lower()
-    auth_shaped = any(h in err_l for h in MCP_AUTH_HINTS)
-    if missing or (result["error"] and auth_shaped):
-        state = "auth_required"
-    elif result["error"] or not result["connected"]:
-        state = "unreachable"
+    # Preflight: a stdio command that isn't installed can be diagnosed in ~1s,
+    # and answers the question the connection test cannot (see
+    # _stdio_command_exists). Skipped for HTTP servers, which have no command.
+    binary_ok = await _stdio_command_exists(cfg) if transport == "stdio" else None
+
+    if binary_ok is False:
+        state = "missing_binary"
+        result["error"] = f"command not found in the container: {cfg.get('command')}"
     else:
-        state = "ok"
+        async def _test() -> dict:
+            try:
+                _, out = await asyncio.wait_for(
+                    _run(*_exec_prefix(), "hermes", "mcp", "test", name), timeout=budget)
+                return _parse_mcp_test(out)
+            except asyncio.TimeoutError:
+                return {"connected": False, "connect_ms": 0, "tools": [], "tool_count": 0,
+                        "error": f"health check exceeded {int(budget)}s"}
+            except Exception as e:  # noqa: BLE001
+                return {"connected": False, "connect_ms": 0, "tools": [], "tool_count": 0,
+                        "error": str(e)}
 
-    if missing:
+        result = await _test()
+        # One retry, only for transient-shaped failures. A real misconfiguration
+        # fails identically twice, so this costs nothing in the common bad case
+        # and rescues the panel from a spurious red on a startup race.
+        if result.get("error") and any(h in result["error"].lower() for h in MCP_TRANSIENT_HINTS):
+            retried = await _test()
+            if retried.get("connected") or not retried.get("error"):
+                result = retried
+            else:
+                result["error"] = retried["error"]
+                result["retried"] = True
+
+        err_l = (result["error"] or "").lower()
+        auth_shaped = any(h in err_l for h in MCP_AUTH_HINTS)
+        if missing or (result["error"] and auth_shaped):
+            state = "auth_required"
+        elif result["error"] or not result["connected"]:
+            state = "unreachable"
+        else:
+            state = "ok"
+
+    # Whatever went wrong, the server's own stderr is the most useful thing we
+    # can show — and for a masked ENOENT it is the only record that exists.
+    if state in ("missing_binary", "unreachable") and transport == "stdio":
+        stderr_tail = await _mcp_stderr_tail(name)
+
+    if state == "missing_binary":
+        # Name the actual remediation. This failure is nearly always a stale
+        # image: `docker compose up -d` reuses the existing one, so a server
+        # added to the Dockerfile after the last --build is simply not there.
+        detail = (
+            f"The agent container has no `{cfg.get('command')}` on its PATH, so the "
+            "server can never start — Hermes reports this only as a closed pipe. "
+            "If it's installed in the image, rebuild the agent: "
+            "`docker compose up -d --build` in DEV/hermes-docker (a plain "
+            "`up -d` reuses the old image and changes nothing)."
+        )
+    elif missing:
         # /opt/data/.env is where Hermes loads dotenv from, but in this compose
         # setup that path is a read-only bind of hermes-docker/.env (the
         # ${PWD}/.env line) — editing ~/.hermes/.env there has no effect, so
@@ -1024,6 +1245,20 @@ async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) ->
     else:
         detail = f"Connected in {result['connect_ms']}ms · {result['tool_count']} tools discovered"
 
+    # Enrich the probe's truncated tool rows with the cached full schema. The
+    # console description stays as the collapsed preview; `full_description`,
+    # `actions` and `params` are what the panel reveals on expand.
+    cached = (schemas or {}).get(name) or {}
+    for tool in result["tools"]:
+        facts = cached.get(tool.get("name"))
+        if not facts:
+            continue
+        tool.update(facts)
+        # A description ending in "..." is the console's truncation, not the
+        # server's text — drop the ellipsis once the real text is attached.
+        if facts["full_description"] and tool.get("description", "").endswith("..."):
+            tool["truncated"] = True
+
     selected = _selected_tool_names(cfg, result["tools"])
     return {
         "name": name,
@@ -1042,6 +1277,15 @@ async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) ->
         "selected_prefixed": [f"mcp__{name}__{t}" for t in selected],
         "env_refs": refs,
         "missing_env": missing,
+        # Diagnostics the panel shows when something is wrong. stderr_tail is
+        # the server's own output — for a masked ENOENT it holds the only
+        # actual traceback anywhere in the system.
+        "stderr_tail": stderr_tail,
+        "binary_ok": binary_ok,
+        "retried": bool(result.get("retried")),
+        # Is Hermes' own auto-recycle armed for this server? A stdio server
+        # without it never comes back on its own after dying mid-run.
+        "recycle": recycle,
     }
 
 
@@ -1082,8 +1326,9 @@ async def mcp_status(refresh: int = 0):
             config_error = str(e)
 
         env_names = await _container_env_names() if servers_cfg else None
+        schemas = await _mcp_schema_cache() if servers_cfg else {}
         results = await asyncio.gather(
-            *(_probe_mcp_server(n, c, env_names) for n, c in servers_cfg.items()),
+            *(_probe_mcp_server(n, c, env_names, schemas) for n, c in servers_cfg.items()),
             return_exceptions=True,
         )
         servers = []
@@ -1107,6 +1352,7 @@ async def mcp_status(refresh: int = 0):
                 "ok": sum(1 for s in servers if s["state"] == "ok"),
                 "auth_required": sum(1 for s in servers if s["state"] == "auth_required"),
                 "unreachable": sum(1 for s in servers if s["state"] == "unreachable"),
+                "missing_binary": sum(1 for s in servers if s["state"] == "missing_binary"),
                 "tools": sum(len(s.get("selected_prefixed") or []) for s in servers),
             },
         }
