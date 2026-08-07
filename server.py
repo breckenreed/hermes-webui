@@ -976,6 +976,66 @@ async def _mcp_stderr_tail(name: str) -> str:
         return ""
 
 
+# Hermes caches each connected server's real tool schemas here (written by
+# tools/mcp_schema_cache.py at connect time). This is the ONLY source of full
+# tool metadata available to the webui: `hermes mcp test` renders a console
+# table whose descriptions it truncates to 55 chars (hermes_cli/mcp_config.py:
+# cmd_mcp_test), after _probe_single_server has already cut them to 80 — so a
+# description parsed from that output is a fragment with no way to recover the
+# rest. The cache holds the untruncated text plus each tool's inputSchema,
+# which is where a consolidated tool's `action` enum lives (manage_task →
+# create/update/delete/move/duplicate). That enum is the thing worth reading
+# before writing a prompt, so it's surfaced explicitly rather than left buried.
+MCP_SCHEMA_CACHE = "/opt/data/cache/mcp_schema_cache.json"
+
+
+def _tool_schema_facts(entry: dict) -> dict:
+    """Pull the useful bits out of one cached tool schema."""
+    schema = entry.get("inputSchema") or entry.get("input_schema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    required = [str(r) for r in required] if isinstance(required, list) else []
+
+    # The action/operation enum a consolidated tool routes on. Servers name it
+    # differently, so check the conventional keys in order of likelihood.
+    actions: list[str] = []
+    for key in ("action", "operation", "mode", "command"):
+        spec = props.get(key)
+        if isinstance(spec, dict) and isinstance(spec.get("enum"), list):
+            actions = [str(v) for v in spec["enum"]]
+            break
+
+    return {
+        "full_description": str(entry.get("description") or ""),
+        "actions": actions,
+        "required_params": [p for p in required if p in props] or required,
+        "params": sorted(props.keys()),
+    }
+
+
+async def _mcp_schema_cache() -> dict:
+    """{server: {tool: {full_description, actions, params, ...}}} or {}."""
+    try:
+        out = await _run_out(*_exec_prefix(), "cat", MCP_SCHEMA_CACHE, timeout=20)
+        raw = json.loads(out[out.index("{"):])
+    except Exception:  # noqa: BLE001
+        return {}
+    cache: dict = {}
+    for server, block in (raw.items() if isinstance(raw, dict) else []):
+        if not isinstance(block, dict):
+            continue
+        tools: dict = {}
+        # `utility_tools` holds the resources/prompts helpers Hermes registers
+        # alongside the server's own tools; both are real, callable tools.
+        for group in ("tools", "utility_tools"):
+            for entry in (block.get(group) or []):
+                if isinstance(entry, dict) and entry.get("name"):
+                    tools[str(entry["name"])] = _tool_schema_facts(entry)
+        cache[server] = tools
+    return cache
+
+
 def _recycle_settings(cfg: dict) -> dict:
     """Whether Hermes' stdio auto-recycle / lazy-reconnect is armed for a server.
 
@@ -1066,7 +1126,8 @@ def _selected_tool_names(cfg: dict, discovered: list[dict]) -> list[str]:
     return names
 
 
-async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) -> dict:
+async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None,
+                            schemas: dict | None = None) -> dict:
     """Config + live health for one MCP server.
 
     States, in the order they're decided:
@@ -1184,6 +1245,20 @@ async def _probe_mcp_server(name: str, cfg: dict, env_names: set[str] | None) ->
     else:
         detail = f"Connected in {result['connect_ms']}ms · {result['tool_count']} tools discovered"
 
+    # Enrich the probe's truncated tool rows with the cached full schema. The
+    # console description stays as the collapsed preview; `full_description`,
+    # `actions` and `params` are what the panel reveals on expand.
+    cached = (schemas or {}).get(name) or {}
+    for tool in result["tools"]:
+        facts = cached.get(tool.get("name"))
+        if not facts:
+            continue
+        tool.update(facts)
+        # A description ending in "..." is the console's truncation, not the
+        # server's text — drop the ellipsis once the real text is attached.
+        if facts["full_description"] and tool.get("description", "").endswith("..."):
+            tool["truncated"] = True
+
     selected = _selected_tool_names(cfg, result["tools"])
     return {
         "name": name,
@@ -1251,8 +1326,9 @@ async def mcp_status(refresh: int = 0):
             config_error = str(e)
 
         env_names = await _container_env_names() if servers_cfg else None
+        schemas = await _mcp_schema_cache() if servers_cfg else {}
         results = await asyncio.gather(
-            *(_probe_mcp_server(n, c, env_names) for n, c in servers_cfg.items()),
+            *(_probe_mcp_server(n, c, env_names, schemas) for n, c in servers_cfg.items()),
             return_exceptions=True,
         )
         servers = []
