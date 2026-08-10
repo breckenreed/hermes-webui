@@ -141,6 +141,12 @@
   .msg .body pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto;margin:8px 0}
   .msg .body pre code{background:none;border:none;padding:0;font-size:12.5px;line-height:1.5;display:block}
   .msg .body a{color:var(--accent2)}
+  /* Converted maths. Kept close to body text — it IS prose, not a code block —
+     with just enough letter-spacing that operators don't crowd their operands. */
+  .msg .body .math{font-family:var(--mono);font-size:.95em;letter-spacing:.02em}
+  .msg .body .mathblock{font-family:var(--mono);font-size:.97em;text-align:center;
+    margin:10px 0;padding:8px 10px;background:var(--code);border:1px solid var(--border);
+    border-radius:8px;overflow-x:auto}
   /* Tables scroll inside their own wrapper — a wide one must never make the
      whole chat pane scroll sideways, especially on a phone. */
   .msg .body .tablewrap{overflow-x:auto;margin:10px 0;border:1px solid var(--border);border-radius:8px}
@@ -648,17 +654,129 @@ function tableHtml(head, aligns, rows){
   return h+"</tbody></table></div>";
 }
 
+/* ---------- inline LaTeX → Unicode ----------
+   Models write maths in prose constantly — "$\rightarrow$", "$x^2$", "$\leq$"
+   — and every one of those was printed literally, dollar signs and all. Real
+   TeX layout would mean KaTeX/MathJax, which this project deliberately can't
+   have (one HTML file, no CDN, works offline). Almost all of it is a single
+   symbol though, so map the commands that actually occur to their Unicode
+   equivalents: \rightarrow → →, x^2 → x², \alpha → α. Anything unrecognised is
+   left exactly as written rather than half-converted into nonsense. */
+const MATH_SYMBOLS = {
+  // arrows — the reported case, and by far the most common
+  "\\rightarrow":"→","\\to":"→","\\leftarrow":"←","\\gets":"←","\\leftrightarrow":"↔",
+  "\\Rightarrow":"⇒","\\implies":"⇒","\\Leftarrow":"⇐","\\Leftrightarrow":"⇔","\\iff":"⇔",
+  "\\uparrow":"↑","\\downarrow":"↓","\\mapsto":"↦","\\hookrightarrow":"↪","\\rightsquigarrow":"⇝",
+  // operators & relations
+  "\\times":"×","\\div":"÷","\\pm":"±","\\mp":"∓","\\cdot":"·","\\ast":"∗","\\star":"⋆",
+  "\\leq":"≤","\\le":"≤","\\geq":"≥","\\ge":"≥","\\neq":"≠","\\ne":"≠","\\approx":"≈",
+  "\\equiv":"≡","\\sim":"∼","\\simeq":"≃","\\cong":"≅","\\propto":"∝","\\ll":"≪","\\gg":"≫",
+  // sets & logic
+  "\\in":"∈","\\notin":"∉","\\ni":"∋","\\subset":"⊂","\\subseteq":"⊆","\\supset":"⊃",
+  "\\supseteq":"⊇","\\cup":"∪","\\cap":"∩","\\setminus":"∖","\\emptyset":"∅","\\varnothing":"∅",
+  "\\forall":"∀","\\exists":"∃","\\nexists":"∄","\\land":"∧","\\wedge":"∧","\\lor":"∨",
+  "\\vee":"∨","\\neg":"¬","\\lnot":"¬","\\therefore":"∴","\\because":"∵",
+  // analysis
+  "\\infty":"∞","\\partial":"∂","\\nabla":"∇","\\sum":"∑","\\prod":"∏","\\int":"∫",
+  "\\iint":"∬","\\oint":"∮","\\sqrt":"√","\\angle":"∠","\\perp":"⊥","\\parallel":"∥",
+  // greek
+  "\\alpha":"α","\\beta":"β","\\gamma":"γ","\\delta":"δ","\\epsilon":"ε","\\varepsilon":"ε",
+  "\\zeta":"ζ","\\eta":"η","\\theta":"θ","\\vartheta":"ϑ","\\iota":"ι","\\kappa":"κ",
+  "\\lambda":"λ","\\mu":"μ","\\nu":"ν","\\xi":"ξ","\\pi":"π","\\rho":"ρ","\\sigma":"σ",
+  "\\tau":"τ","\\upsilon":"υ","\\phi":"φ","\\varphi":"φ","\\chi":"χ","\\psi":"ψ","\\omega":"ω",
+  "\\Gamma":"Γ","\\Delta":"Δ","\\Theta":"Θ","\\Lambda":"Λ","\\Xi":"Ξ","\\Pi":"Π",
+  "\\Sigma":"Σ","\\Upsilon":"Υ","\\Phi":"Φ","\\Psi":"Ψ","\\Omega":"Ω",
+  // misc
+  "\\ldots":"…","\\dots":"…","\\cdots":"⋯","\\vdots":"⋮","\\prime":"′","\\degree":"°",
+  "\\bullet":"•","\\circ":"∘","\\oplus":"⊕","\\otimes":"⊗","\\checkmark":"✓","\\%":"%",
+  "\\&":"&amp;","\\#":"#","\\$":"$","\\{":"{","\\}":"}",
+};
+// Longest-first so \leftrightarrow wins over \leftarrow, \Rightarrow over \to.
+const MATH_MACRO_RE = new RegExp(
+  Object.keys(MATH_SYMBOLS).sort((a,b)=>b.length-a.length)
+    .map(k=>k.replace(/[\\^$.*+?()[\]{}|]/g,"\\$&")).join("|"), "g");
+
+const SUPS = {"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹",
+  "+":"⁺","-":"⁻","−":"⁻","=":"⁼","(":"⁽",")":"⁾","n":"ⁿ","i":"ⁱ","T":"ᵀ"};
+const SUBS = {"0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇","8":"₈","9":"₉",
+  "+":"₊","-":"₋","−":"₋","=":"₌","(":"₍",")":"₎","a":"ₐ","e":"ₑ","h":"ₕ","i":"ᵢ","j":"ⱼ",
+  "k":"ₖ","l":"ₗ","m":"ₘ","n":"ₙ","o":"ₒ","p":"ₚ","r":"ᵣ","s":"ₛ","t":"ₜ","u":"ᵤ","v":"ᵥ","x":"ₓ"};
+// All-or-nothing: "x^{n+1}" converts only if every character has a form, so a
+// partial mapping can never produce something like "x²ᵃ+1".
+function toScript(chars, map, original){
+  let out="";
+  for(const c of chars){ if(!map[c]) return original; out+=map[c]; }
+  return out;
+}
+
+function latexToUnicode(src){
+  let s = src;
+  s = s.replace(/\\(?:d|t)?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, "$1/$2");
+  s = s.replace(/\\sqrt\s*\{([^{}]*)\}/g, "√($1)");
+  // Text-mode wrappers carry no symbol meaning — keep only their contents.
+  s = s.replace(/\\(?:text|textrm|textbf|textit|mathrm|mathbf|mathit|mathsf|operatorname)\s*\{([^{}]*)\}/g, "$1");
+  s = s.replace(MATH_MACRO_RE, m => MATH_SYMBOLS[m] ?? m);
+  // A braced group that can't be fully scripted keeps its grouping as parens:
+  // the brace strip below would otherwise turn "x^{n+q}" into "x^n+q", which
+  // reads as though only n were the exponent.
+  s = s.replace(/\^\{([^{}]+)\}/g, (m,g)=>toScript(g, SUPS, "^("+g+")"));
+  s = s.replace(/_\{([^{}]+)\}/g,  (m,g)=>toScript(g, SUBS, "_("+g+")"));
+  // Single-character form, excluding "(" so the parenthesised fallback just
+  // emitted above isn't re-processed into "x⁽n+q)".
+  s = s.replace(/\^([^\s({])/g,    (m,g)=>toScript(g, SUPS, m));
+  s = s.replace(/_([^\s({])/g,     (m,g)=>toScript(g, SUBS, m));
+  s = s.replace(/\\[,;:!>]|\\q?quad/g, " ");   // spacing macros
+  s = s.replace(/\\left|\\right/g, "");
+  return s.replace(/[{}]/g, "").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/* Is a `$…$` span actually maths, or just money? "$5 and $10" must stay text.
+   Require a real TeX signal (backslash / superscript / subscript) or a very
+   short symbolic token like "$n$" — anything else is left alone. */
+function looksLikeMath(body){
+  if(!body || body.length > 300) return false;
+  if(/[\\^_]/.test(body)) return true;
+  return /^[A-Za-z][A-Za-z0-9]{0,2}$/.test(body);
+}
+function mathSpan(body, display){
+  const out = latexToUnicode(body);
+  return display ? `<div class="mathblock">${out}</div>` : `<span class="math">${out}</span>`;
+}
+function applyMath(h){
+  h = h.replace(/\\\[([\s\S]+?)\\\]/g, (m,g)=>mathSpan(g, true));
+  h = h.replace(/\\\(([\s\S]+?)\\\)/g, (m,g)=>mathSpan(g, false));
+  h = h.replace(/\$\$([^$]+?)\$\$/g,   (m,g)=>mathSpan(g, true));
+  h = h.replace(/\$([^$\n]+?)\$/g,     (m,g)=>looksLikeMath(g) ? mathSpan(g, false) : m);
+  return h;
+}
+
+/* One inline formatter for every context — paragraphs, headings, list items and
+   table cells — so emphasis, links and maths can't drift apart between them.
+   Code spans are pulled out first and put back last: a `$x$` or `\times` shown
+   INSIDE backticks is being quoted, not typeset, and must survive verbatim. */
+// Sentinel written as an escape, never a raw byte: a literal NUL in the file
+// makes it binary to grep/diff and is liable to be stripped in transit.
+// Sentinel written as an escape, never a raw byte: a literal NUL makes the
+// file binary to grep/diff and is liable to be stripped in transit.
+const CODE_TOKEN = "\u0000c";
+function inlineFormat(text){
+  const codes = [];
+  let h = esc(text);
+  h = h.replace(/`([^`]+)`/g, (m,g)=>{ codes.push(g); return CODE_TOKEN+(codes.length-1)+"\u0000"; });
+  h = applyMath(h);
+  h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  h = h.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return h.replace(/\u0000c(\d+)\u0000/g, (m,i)=>`<code>${codes[+i]}</code>`);
+}
+
 function renderInline(text){
   const lines = text.split("\n");
   let out="", listOpen=null;
   const flush=()=>{ if(listOpen){out+=`</${listOpen}>`;listOpen=null;} };
   for(let i=0;i<lines.length;i++){
     const ln = lines[i];
-    let h = esc(ln);
-    h = h.replace(/`([^`]+)`/g,"<code>$1</code>");
-    h = h.replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>");
-    h = h.replace(/(^|[^*])\*([^*]+)\*/g,"$1<em>$2</em>");
-    h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+    const h = inlineFormat(ln);
     let m;
     if((m=ln.match(/^(#{1,3})\s+(.*)/))){ flush(); out+=`<h${m[1].length}>${renderInlineNoBlock(m[2])}</h${m[1].length}>`; continue; }
     // Table — checked before lists, since a delimiter row starting with "-"
@@ -684,12 +802,9 @@ function renderInline(text){
   flush();
   return out;
 }
-function renderInlineNoBlock(t){
-  return esc(t).replace(/`([^`]+)`/g,"<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*]+)\*/g,"$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-}
+// Headings, list items and table cells all route through the same formatter as
+// paragraphs, so maths/emphasis/links can't behave differently between them.
+const renderInlineNoBlock = inlineFormat;
 
 /* ---------- chat UI ---------- */
 function clearEmpty(){ const e=$(".empty"); if(e) e.remove(); }
