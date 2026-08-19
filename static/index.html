@@ -167,7 +167,16 @@
   .empty code{font-family:var(--mono);color:var(--accent2)}
 
   /* Composer */
-  #composer{border-top:1px solid var(--border);background:var(--panel);padding:14px 0}
+  #composer{border-top:1px solid var(--border);background:var(--panel);padding:14px 0;position:relative}
+  /* Anchored to the composer, not to a fixed offset from the bottom, so it
+     stays put as the textarea grows or the queue bar appears. */
+  #jumpbtn{position:absolute;top:-44px;left:50%;transform:translateX(-50%);z-index:15;
+    display:none;align-items:center;gap:6px;background:var(--panel2);color:var(--text);
+    border:1px solid var(--border);border-radius:999px;padding:7px 15px;
+    font-size:12px;font-family:var(--mono);cursor:pointer;
+    box-shadow:0 6px 18px rgba(0,0,0,.32)}
+  #jumpbtn.show{display:flex}
+  #jumpbtn:hover{border-color:var(--accent);color:var(--accent2)}
   #composer .wrap{display:flex;gap:10px;align-items:flex-end;position:relative}
   #input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:10px;color:var(--text);
     font-family:var(--sans);font-size:14px;padding:11px 14px;resize:none;max-height:200px;line-height:1.5;outline:none}
@@ -444,6 +453,7 @@
     </div>
     <div id="chat"><div class="wrap" id="messages"></div></div>
     <div id="composer">
+      <button id="jumpbtn" title="Jump to the latest output">↓ Latest</button>
       <div class="wrap">
         <textarea id="input" rows="1" placeholder="Command Hermes…  (Enter to send · Shift+Enter for newline)"></textarea>
         <button id="modelbtn" title="Pick which model handles the next message">🖥 Local</button>
@@ -819,9 +829,20 @@ function showEmpty(){
 }
 function renderConversation(){
   if(!messages.length){ showEmpty(); return; }
+  // A full rebuild resets scrollTop to 0. The recovery poller re-renders every
+  // 4s while a turn runs, so without preserving the offset a reader who had
+  // scrolled up got thrown to the TOP of the transcript on every tick.
+  const prevTop = chatEl.scrollTop;
   messagesEl.innerHTML="";
   messages.forEach(m=> renderMessage(m.role, m.text, m.tools, m.ts));
-  scroll();
+  if(stickToBottom){ scroll(); }
+  else {
+    // Everything that changed sits at the END of the transcript (a growing
+    // reply, an appended message), so content above the viewport is unchanged
+    // and the previous offset still shows exactly what the reader was reading.
+    chatEl.scrollTop = prevTop;
+    showJumpPill();
+  }
 }
 function addMsg(role){
   clearEmpty();
@@ -832,7 +853,50 @@ function addMsg(role){
   scroll();
   return body;
 }
-function scroll(){ chatEl.scrollTop = chatEl.scrollHeight; }
+
+/* ---------- scroll anchoring ----------
+   The transcript used to be yanked to the bottom on EVERY repaint, and while a
+   turn is running that means every streamed chunk, every tool event and every
+   4s recovery poll. Scrolling up to re-read the prompt, or to check what the
+   agent just did, was impossible until the turn finished — you'd be dragged
+   back down within a second or two, every time.
+
+   Follow the tail only while the reader is ALREADY at the tail. The moment they
+   scroll away the viewport stops moving and a pill offers the way back;
+   returning to the bottom re-arms following on its own, so it needs no
+   dismissing and has no setting. */
+const STICK_PX = 80;        // "close enough to the bottom" — also absorbs momentum scroll
+let stickToBottom = true;
+
+function atBottom(){
+  return chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight <= STICK_PX;
+}
+function showJumpPill(){ $("#jumpbtn").classList.add("show"); }
+function hideJumpPill(){ $("#jumpbtn").classList.remove("show"); }
+
+// force:true = the reader just did something that means "take me to the end"
+// (sent a message, opened a conversation, tapped the pill).
+function scroll(force){
+  if(force) stickToBottom = true;
+  if(!stickToBottom){ showJumpPill(); return; }
+  chatEl.scrollTop = chatEl.scrollHeight;
+  // Re-assert once layout has settled. Setting scrollTop immediately after an
+  // innerHTML swap can land short if the new content reflows afterwards (a
+  // table or code block in a streamed reply), and the scroll listener would
+  // then read "not at the bottom" and silently stop following.
+  requestAnimationFrame(()=>{ if(stickToBottom) chatEl.scrollTop = chatEl.scrollHeight; });
+  hideJumpPill();
+}
+
+// One source of truth: the actual scroll position. A programmatic jump to the
+// bottom lands here too and re-arms following, so the flag can never drift out
+// of sync with what the reader is looking at.
+chatEl.addEventListener("scroll", ()=>{
+  stickToBottom = atBottom();
+  if(stickToBottom) hideJumpPill();
+}, {passive:true});
+
+$("#jumpbtn").onclick=()=>scroll(true);
 
 function renderConvos(){
   const box = $("#sessions"); box.innerHTML="";
@@ -1027,6 +1091,9 @@ function openConvo(id){
   activeId=id; try{ localStorage.setItem(ACTIVE_LS, id); }catch(e){}
   messages = loadMsgs(id);
   $("#cursession").textContent = convoTitle(id) || "chat";
+  // Opening a conversation always lands at its newest message; detachment is
+  // per-viewing, not a state carried across chats.
+  stickToBottom = true; hideJumpPill();
   renderConversation();
   renderConvos();
   updateCtxMeter();
@@ -1188,6 +1255,9 @@ async function send(arg){
     touchConvo(forConvo, firstUser ? displayText.slice(0,60) : null);
     if(isActive()){
       const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(displayText);
+      // Sending is an explicit "I'm done reading back" — go to the end even if
+      // the reader had scrolled up, and re-arm following for the reply.
+      scroll(true);
       $("#cursession").textContent = convoTitle(forConvo) || "chat";
     }
     renderConvos();
