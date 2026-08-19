@@ -858,6 +858,7 @@ function openMenu(anchor, s){
   const m=document.createElement("div"); m.className="menu";
   m.innerHTML=
     `<button data-a="rename">✎ Rename</button>`+
+    `<button data-a="duplicate">⎘ Duplicate</button>`+
     `<button data-a="copy">⧉ Copy ID</button>`+
     `<div class="sep"></div>`+
     `<button data-a="delete" class="danger">🗑 Delete</button>`;
@@ -869,6 +870,7 @@ function openMenu(anchor, s){
   m.querySelectorAll("button").forEach(b=>{
     b.onclick=()=>{ const a=b.dataset.a; closeMenu();
       if(a==="rename") renameConvo(s);
+      else if(a==="duplicate") duplicateConvo(s);
       else if(a==="copy"){ navigator.clipboard.writeText(s.id).then(()=>toast("Conversation ID copied")); }
       else if(a==="delete") deleteConvo(s);
     };
@@ -895,6 +897,49 @@ function deleteConvo(c){
   }
   renderConvos();
   toast("Conversation deleted");
+}
+
+/* ---------- duplicate a conversation ----------
+   Cheap, and entirely a client-side operation, because the webui OWNS
+   conversations: they live in localStorage and the full history is injected
+   into every prompt (see "Conversations live in the browser"). `hermes -z` is
+   one-shot and forks a fresh session per turn, so there is no server-side chat
+   to fork and nothing about --yolo or Hermes' session store is involved — a
+   duplicate is a storage clone.
+
+   Fork-from-here, in other words: copy a conversation at its current state and
+   take the copy in a different direction without disturbing the original.
+
+   Two things must NOT come along:
+     • the pending-turn mapping (convoId -> turnKey). Two conversations pointing
+       at one server turn would both reattach to it and both write that reply
+       into themselves — precisely the cross-conversation corruption that
+       per-conversation turn tracking exists to prevent. A fresh id simply has
+       no PENDING_LS entry, and nothing here creates one.
+     • the transient "⏳ … (running on the server)" placeholder that
+       recoverPending() writes while a turn is in flight. In the original it is
+       replaced when that turn lands; in a copy no turn of its own will ever
+       replace it, so it would sit there looking busy forever. */
+function copyTitle(title){
+  const base = (title || "New chat").replace(/\s*\(copy(?: \d+)?\)$/, "");
+  const taken = new Set(convos.map(c => c.title));
+  let name = `${base} (copy)`;
+  for(let n = 2; taken.has(name); n++) name = `${base} (copy ${n})`;
+  return name;
+}
+
+function duplicateConvo(c){
+  const src = loadMsgs(c.id).filter(m => !m.live);
+  const id = newConvoId();
+  // Clone the tools array too — a shared reference would let a later tool line
+  // appended to one conversation show up in the other.
+  saveMsgs(id, src.map(m => ({...m, tools: [...(m.tools || [])]})));
+  touchConvo(id, copyTitle(c.title));
+  renderConvos();
+  openConvo(id);
+  toast(isBusy(c.id)
+    ? "Duplicated — the reply still running in the original isn't included"
+    : `Duplicated ${src.length} message${src.length === 1 ? "" : "s"}`);
 }
 
 function renameConvo(c){
@@ -1944,7 +1989,10 @@ async function recoverPending(forId){
       const partial=rebuildFromRecord(j);
       const elapsed = j.started ? ` · ${fmtElapsed(Date.now()/1000 - j.started)}` : "";
       partial.text += (partial.text?"\n\n":"") + `_⏳ ${j.label || "Working…"}${elapsed} (running on the server)_`;
-      applyToConvo(id, partial);
+      // `live` marks this as a transient status message, not real transcript:
+      // the next applyToConvo replaces it when the turn lands, and duplicating
+      // the conversation drops it rather than baking a stuck spinner into the copy.
+      applyToConvo(id, {...partial, live:true});
       const t=setTimeout(()=>recoverPending(id), 4000);
       recoverTimers.set(id, t);
     } else if(j.failed){
