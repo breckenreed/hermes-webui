@@ -96,6 +96,9 @@
   #brand h1{font-size:15px;margin:0;letter-spacing:.5px;display:flex;align-items:center;gap:8px}
   #brand .dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red)}
   #brand .dot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+  /* Amber = container up but the agent isn't answering. Its own colour because
+     it is neither "fine" nor "gone", and the remedy differs from both. */
+  #brand .dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber)}
   #brand small{color:var(--muted);font-family:var(--mono);font-size:11px;display:block;margin-top:4px}
   #newchat{margin:12px;padding:10px;background:var(--accent);color:var(--on-accent);border:none;border-radius:8px;font-weight:600;cursor:pointer;font-size:13px}
   #newchat:hover{background:var(--accent2)}
@@ -1116,13 +1119,67 @@ function newConvo(){
   $("#input").focus();
 }
 
+/* ---------- health ----------
+   The dot has three states, because "container is running" and "the agent can
+   take a turn" are different questions. Conflating them is what showed a green
+   light straight through an outage: the agent container exited cleanly, its
+   restart policy revived it, every in-flight turn died — and the old check,
+   which only read {{.State.Running}}, said "running" the whole time.
+
+   `started_at` changes whenever the container is recreated or revived, so a
+   turn that began before that timestamp cannot have survived. That is how a
+   restart is noticed within one poll instead of waiting out the 45s stream
+   watchdog. */
+let agentStartedAt = null;
+
+function agentRestarted(startedAt){
+  // Any turn older than the agent's current start is dead: the process that
+  // was serving it no longer exists. Cut the stream so the normal recovery
+  // path runs now rather than after the watchdog eventually gives up.
+  const newStart = Date.parse(startedAt || "") || 0;
+  let cut = 0;
+  inFlight.forEach((rec, convoId)=>{
+    if(newStart && rec.startedAt < newStart){
+      rec.watchdogAborted = true;   // reuse the "reattach, don't report stopped" path
+      rec.abort.abort();
+      cut++;
+    }
+  });
+  toast(cut
+    ? `⚠️ Agent restarted — ${cut} running turn${cut===1?"":"s"} interrupted, recovering…`
+    : "⚠️ Agent restarted");
+}
+
 async function health(){
   try{
     const r=await fetch("/api/health"); const j=await r.json();
-    $("#statusdot").classList.toggle("ok", !!j.ok);
-    $("#statustext").textContent = j.ok ? `${j.container} · running` : `${j.container} · ${j.running||"offline"}`;
+    const dot=$("#statusdot");
+    dot.classList.toggle("ok", j.state==="ok");
+    dot.classList.toggle("warn", j.state==="degraded");
+    $("#statustext").textContent =
+      j.state==="ok"       ? `${j.container} · ready`
+    : j.state==="degraded" ? `${j.container} · not responding`
+    :                        `${j.container} · ${j.running||"offline"}`;
+    // The detail belongs in the tooltip, not the sidebar line, but it is the
+    // difference between "it's broken" and knowing why.
+    $("#statustext").title = [
+      `state: ${j.state}`,
+      j.agent_detail ? `agent: ${j.agent_detail}` : "",
+      j.started_at ? `started: ${new Date(j.started_at).toLocaleString()}` : "",
+      j.restart_count ? `restarts: ${j.restart_count}` : "",
+      j.oom_killed ? "last exit: OOM-killed" :
+        (j.last_exit_code ? `last exit code: ${j.last_exit_code}` : ""),
+    ].filter(Boolean).join("\n");
     $("#containername").textContent = j.container;
-  }catch(e){ $("#statustext").textContent="backend offline"; }
+
+    if(j.started_at){
+      if(agentStartedAt && j.started_at !== agentStartedAt) agentRestarted(j.started_at);
+      agentStartedAt = j.started_at;
+    }
+  }catch(e){
+    $("#statustext").textContent="backend offline";
+    $("#statusdot").classList.remove("ok","warn");
+  }
 }
 
 /* ---------- send / stop (per conversation) ---------- */
@@ -1264,7 +1321,9 @@ async function send(arg){
   }
 
   const turnKey = forConvo+"__"+Date.now().toString(36);
-  const rec = {turnKey, abort:new AbortController(), watchdogAborted:false,
+  // startedAt is compared against the agent container's start time, so a
+  // restart can identify exactly which turns it killed.
+  const rec = {turnKey, startedAt:Date.now(), abort:new AbortController(), watchdogAborted:false,
                lastEventTs:Date.now(), userStopped:false, steering:false, steerText:"", queued:null};
   inFlight.set(forConvo, rec);
   if(isActive()) syncComposerUI();
