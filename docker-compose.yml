@@ -22,11 +22,26 @@ services:
       - HERMES_MODEL=
       # Context note prepended to every prompt so small local models use their
       # tools instead of hallucinating their environment. Set empty to disable.
-      # Leave unset to use the built-in default (mentions /host/MyVault).
-      # - HERMES_SYSTEM_PREAMBLE=You are in a Linux container; the vault is at /host/MyVault (rw). Always use your tools; never guess.
+      # The built-in default names no paths on purpose. Set this only to add
+      # something true about THIS install — and only a path that exists in the
+      # agent container, or the model will trust it over what its tools see.
+      # - HERMES_SYSTEM_PREAMBLE=You are in a Linux container; the Obsidian vault is at /host/Vaults/MainVault (rw). Always use your tools; never guess.
+      #
+      # Turn-record retention. Records are how a reply that finished while
+      # nobody was attached survives to be read later; these bound the store.
+      - TURNS_MAX_FILES=${TURNS_MAX_FILES:-200}
+      - TURNS_MAX_AGE_DAYS=${TURNS_MAX_AGE_DAYS:-7}
     env_file:
       - ./.env
     volumes:
       # Docker Desktop exposes the engine here; this lets the webui run
       # `docker exec hermes-agent hermes ...`
       - //var/run/docker.sock:/var/run/docker.sock
+      # Turn records. A named volume, because the container filesystem is
+      # discarded on every `up -d --build` — the records used to live under
+      # /tmp inside the container and were silently lost on each rebuild,
+      # which defeated the point of persisting them at all.
+      - hermes-webui-state:/app/state
+
+volumes:
+  hermes-webui-state:

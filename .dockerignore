@@ -1,0 +1,25 @@
+# Keep the build context small. The Dockerfile COPYs named files only, so
+# none of this would end up in the image regardless — but everything here is
+# still uploaded to the daemon on every build, and .venv alone is ~50MB.
+.git
+.venv
+.pytest_cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Dev-only — never needed to build or run the image.
+tests/
+requirements-dev.txt
+pytest.ini
+
+# Secrets. The token and LLM key are passed at runtime via env_file, and must
+# not be baked into an image layer.
+.env
+.env.local
+*.env.bak*
+
+.DS_Store
+.idea/
+.vscode/
+.claude/
