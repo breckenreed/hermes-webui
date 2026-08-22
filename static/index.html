@@ -784,7 +784,14 @@ function inlineFormat(text){
   h = applyMath(h);
   h = h.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   h = h.replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
-  h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  /* The URL is interpolated into an href="..." attribute, so it must not be
+     able to close that attribute. esc() above neutralises < and > but leaves
+     quotes alone, so without excluding them here a link the model emitted
+     from untrusted content it just read — [x](https://a" onmouseover="…) —
+     would break out and inject an event handler. Whitespace and backtick are
+     excluded for the same reason. The CSP nonce blocks the handler too; this
+     is the half that does not depend on the browser. */
+  h = h.replace(/\[([^\]]+)\]\((https?:[^)\s"'`<>]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return h.replace(/\u0000c(\d+)\u0000/g, (m,i)=>`<code>${codes[+i]}</code>`);
 }
 
@@ -1336,24 +1343,44 @@ async function send(arg){
     else if(!aWrap.isConnected){ clearEmpty(); messagesEl.append(aWrap); }
     return aBody;
   }
-  ensureBubble();
-
   let finalText="";           // accumulated non-tool output
   let interrupted=false, stopped=false;
   let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
   let lastCallMcp=false;        // was the tool that produced the next result an MCP one?
   let mcpAuthToasted=false;     // warn about a rejected MCP call once per turn
+
+  /* The status line, with how long the turn has been running. Matches what
+     /api/turn reports on reattach, so staying on the page and reloading it
+     tell you the same thing — it used to be that only the reload did. */
+  function statusLine(){
+    return `⏺ ${status} · ${fmtElapsed((Date.now()-rec.startedAt)/1000)}`;
+  }
   function repaint(){
     const b=ensureBubble(); if(!b) return;   // conversation isn't on screen — storage-only for now
     let html="";
     toolLines.forEach(t=> html+=toolHtml(t));
     const shown = stripDoneToken(finalText);   // never flash [[TASK_COMPLETE]]
     html += renderMarkdown(shown);
-    if(inFlight.has(forConvo) && !shown) html += `<div class="status">⏺ ${esc(status)}</div>`;
+    if(inFlight.has(forConvo) && !shown) html += `<div class="status">${esc(statusLine())}</div>`;
     if(inFlight.has(forConvo)) html += `<span class="cursor"></span>`;
     b.innerHTML=html; scroll();
   }
+
+  // Paint before the first byte arrives. The bubble used to be created empty
+  // and stay that way until the first tool call — which on a slow local model
+  // is minutes of a blank pane that looks indistinguishable from a hang.
+  repaint();
+
+  /* Advance the clock on its own. Events are what normally trigger a repaint,
+     and a model thinking before its first token emits none — the server's
+     15s pings are deliberately not repaints. Only the status text is touched,
+     so this never re-renders accumulated markdown once output starts. */
+  const statusTicker=setInterval(()=>{
+    if(!inFlight.has(forConvo)) return;
+    const el = aBody && aBody.isConnected ? aBody.querySelector(".status") : null;
+    if(el) el.textContent = statusLine();
+  }, 1000);
 
   // Watchdog: if no event (server pings every 15s) arrives for 45s, the
   // stream is silently dead (mobile suspends the socket without firing an
@@ -1443,6 +1470,7 @@ async function send(arg){
     }
   }finally{
     clearInterval(watchdog);
+    clearInterval(statusTicker);
     const taskComplete = finalText.includes(AGENT_DONE_TOKEN);
     finalText = stripDoneToken(finalText);
     inFlight.delete(forConvo);

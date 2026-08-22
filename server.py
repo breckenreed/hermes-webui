@@ -23,13 +23,16 @@ import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
+import tempfile
+import time
 from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from pydantic import BaseModel
 
 HERMES_CONTAINER = os.environ.get("HERMES_CONTAINER", "hermes-agent")
@@ -42,11 +45,17 @@ STATIC_DIR = Path(__file__).parent / "static"
 # hallucinate their environment ("I'm a WSL instance…") and answer filesystem
 # questions without actually running a tool. This nudges them to act. Override
 # with HERMES_SYSTEM_PREAMBLE; set it to an empty string to disable entirely.
+#
+# It deliberately names NO specific path. An earlier version hardcoded one
+# installation's vault location, which every deployment then inherited: the
+# model was told a directory existed, found nothing there, and spent the turn
+# reasoning about the missing path instead of looking. A wrong path is worse
+# than no path — it overrides what the tools would have shown. Anything
+# site-specific belongs in HERMES_SYSTEM_PREAMBLE, per install.
 _DEFAULT_PREAMBLE = (
-    "You are running inside a Linux container (not WSL). The user's Obsidian "
-    "vault is bind-mounted read-write at /host/MyVault. Always use your "
-    "tools to inspect or modify the filesystem — never guess about your "
-    "environment or where files live."
+    "You are running inside a Linux container (not WSL). Always use your "
+    "tools to inspect the filesystem and find where things actually live — "
+    "never guess about your environment or the location of files."
 )
 SYSTEM_PREAMBLE = os.environ.get("HERMES_SYSTEM_PREAMBLE", _DEFAULT_PREAMBLE).strip()
 
@@ -89,16 +98,218 @@ app = FastAPI(title="Hermes WebUI")
 # localhost-only setups.
 WEBUI_TOKEN = os.environ.get("WEBUI_TOKEN", "").strip()
 
+# A token short enough to guess is not a token. 16 chars of the
+# `openssl rand -hex 16` the README suggests is the floor we warn below.
+TOKEN_MIN_LENGTH = 16
+
+# Brute-force throttle. The token is a single shared secret with no account
+# lockout behind it, so an unthrottled endpoint is a pure online guessing
+# oracle — at LAN speed a short token falls in minutes. After
+# AUTH_MAX_FAILURES bad tokens an IP is refused outright for
+# AUTH_LOCKOUT_SECONDS, which turns that into a rate no longer worth running.
+AUTH_MAX_FAILURES = int(os.environ.get("WEBUI_AUTH_MAX_FAILURES", "10"))
+AUTH_LOCKOUT_SECONDS = float(os.environ.get("WEBUI_AUTH_LOCKOUT_SECONDS", "60"))
+# Bound the table so a spoofed-source flood can't grow it without limit.
+_AUTH_TABLE_MAX = 1024
+# ip -> {"fails": int, "until": float, "last": str}
+_AUTH_FAILURES: dict[str, dict] = {}
+
+
+def _token_digest(value: str) -> str:
+    """Short fingerprint of a rejected token, for repeat detection.
+
+    Hashed rather than stored: the counter only needs to know whether this is
+    the same wrong value again, and keeping user-supplied secrets in memory
+    (a mistyped *correct* token, say) is not worth it.
+    """
+    import hashlib
+
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _client_ip(request: Request) -> str:
+    """Source address for throttling.
+
+    Deliberately NOT X-Forwarded-For: that header is attacker-controlled on a
+    directly-exposed port, so honouring it would let a single client mint a
+    fresh identity per guess and walk straight through the lockout.
+    """
+    return (request.client.host if request.client else "") or "unknown"
+
+
+def _auth_locked(ip: str) -> float:
+    """Seconds remaining on this IP's lockout, or 0 when it may try."""
+    entry = _AUTH_FAILURES.get(ip)
+    if not entry:
+        return 0.0
+    if not entry["until"]:
+        # Counting failures but not locked yet. Must NOT be discarded here:
+        # dropping the entry on every unlocked request resets the tally each
+        # time and the threshold is then never reached.
+        return 0.0
+    remaining = entry["until"] - time.time()
+    if remaining <= 0:
+        # A real lockout that has now elapsed — clear it so a client that
+        # waited it out starts clean rather than one failure from the next.
+        _AUTH_FAILURES.pop(ip, None)
+        return 0.0
+    return remaining
+
+
+def _auth_record_failure(ip: str, supplied: str = "") -> None:
+    """Count a rejected token — once per DISTINCT wrong value.
+
+    Counting requests instead would lock users out of their own webui: the page
+    fires ~6 parallel /api/ calls on load, so a single stale token in
+    localStorage (after the operator rotates WEBUI_TOKEN) burns 6 of the
+    allowance per reload, and the second reload locks the tab out — including
+    the unlock request itself, which is what makes it unrecoverable.
+
+    A brute-force run never repeats a guess, so it is counted exactly as
+    before; only an immediate repeat of the *same* wrong value is free.
+    """
+    if len(_AUTH_FAILURES) >= _AUTH_TABLE_MAX:
+        # Evict whatever expires soonest — it is the least informative entry.
+        oldest = min(_AUTH_FAILURES, key=lambda k: _AUTH_FAILURES[k]["until"])
+        _AUTH_FAILURES.pop(oldest, None)
+    entry = _AUTH_FAILURES.setdefault(ip, {"fails": 0, "until": 0.0, "last": ""})
+    digest = _token_digest(supplied)
+    if entry.get("last") == digest:
+        return                      # same wrong token again — already counted
+    entry["last"] = digest
+    entry["fails"] += 1
+    if entry["fails"] >= AUTH_MAX_FAILURES:
+        entry["fails"] = 0
+        entry["until"] = time.time() + AUTH_LOCKOUT_SECONDS
+
+
+def _token_ok(supplied: str) -> bool:
+    """Constant-time token comparison that cannot raise.
+
+    hmac.compare_digest() rejects non-ASCII `str` inputs with TypeError, so a
+    header carrying e.g. Cyrillic used to surface as a 500 with a traceback
+    instead of a clean 401. Comparing UTF-8 bytes keeps the timing property
+    and accepts any input.
+    """
+    try:
+        return hmac.compare_digest(supplied.encode("utf-8"),
+                                   WEBUI_TOKEN.encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _audit_token_config() -> list[str]:
+    """Warnings about the current access-control setup, worst first.
+
+    Returned rather than printed so a test can assert on them; the server
+    prints them once at startup.
+    """
+    warnings: list[str] = []
+    if not WEBUI_TOKEN:
+        warnings.append(
+            "WEBUI_TOKEN is not set — anyone who can reach this port gets full "
+            "agent access, including unconfirmed file writes (--yolo). Safe "
+            "only when the port is bound to localhost.")
+    elif len(WEBUI_TOKEN) < TOKEN_MIN_LENGTH:
+        warnings.append(
+            f"WEBUI_TOKEN is only {len(WEBUI_TOKEN)} characters — use at least "
+            f"{TOKEN_MIN_LENGTH} (`openssl rand -hex 16`).")
+    if WEBUI_TOKEN and os.environ.get("WEBUI_TLS", "") != "1":
+        warnings.append(
+            "WEBUI_TLS is off — the access token crosses the network in "
+            "cleartext. Set WEBUI_TLS=1 on anything but localhost.")
+    return warnings
+
 
 @app.middleware("http")
 async def require_token(request: Request, call_next):
     if WEBUI_TOKEN and request.url.path.startswith("/api/"):
+        ip = _client_ip(request)
+        locked = _auth_locked(ip)
+        if locked > 0:
+            return JSONResponse(
+                {"error": "too many failed attempts"},
+                status_code=429,
+                headers={"Retry-After": str(int(locked) + 1)},
+            )
         supplied = request.headers.get("authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
-        if not hmac.compare_digest(supplied, WEBUI_TOKEN):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if not _token_ok(supplied):
+            _auth_record_failure(ip, supplied)
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        _AUTH_FAILURES.pop(ip, None)   # a good token clears the streak
     return await call_next(request)
+
+
+# ── Security headers ─────────────────────────────────────────────────────
+# The chat pane renders model output as HTML (renderMarkdown -> innerHTML),
+# and that output routinely quotes web pages and files the agent just read —
+# i.e. content an attacker may control. The escaping in index.html is the
+# first line of defence; this CSP is the second, so that a bug in one is not
+# game over. `script-src` carries a per-response nonce and NO 'unsafe-inline',
+# which is what makes it worth having: an injected <script> or onerror=
+# handler has no way to name a valid nonce and simply does not execute.
+#
+# 'unsafe-inline' remains for style-src only — index.html uses inline
+# style="..." attributes in a handful of places, and a style injection cannot
+# execute script under this policy.
+STATIC_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": (
+        "geolocation=(), microphone=(), camera=(), usb=(), payment=(), "
+        "magnetometer=(), gyroscope=()"
+    ),
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
+
+
+def _csp(nonce: str) -> str:
+    return "; ".join([
+        "default-src 'self'",
+        f"script-src 'self' 'nonce-{nonce}'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data:",
+        "font-src 'self'",
+        # Same-origin XHR/SSE only: nothing in this app should ever be able to
+        # phone home, so an injected exfiltration beacon has nowhere to send.
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "object-src 'none'",
+        "frame-ancestors 'none'",
+        "form-action 'none'",
+    ])
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Attach the security headers to every response.
+
+    Registered after require_token, which makes it the OUTER middleware —
+    Starlette runs the most recently added first — so the headers land on
+    401/429 rejections too, not only on responses that got past auth.
+    """
+    nonce = secrets.token_urlsafe(16)
+    request.state.csp_nonce = nonce
+    response = await call_next(request)
+    for key, value in STATIC_HEADERS.items():
+        response.headers.setdefault(key, value)
+    response.headers.setdefault("Content-Security-Policy", _csp(nonce))
+    if os.environ.get("WEBUI_TLS", "") == "1":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000")
+    if request.url.path.startswith("/api/"):
+        # Transcripts and the token-bearing requests that fetch them have no
+        # business in a shared cache or a browser's disk cache.
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 # Matches Hermes session IDs like 20260715_193102_62eba9
 SESSION_ID_RE = re.compile(r"\d{8}_\d{6}_[0-9a-f]{6}")
@@ -135,9 +346,31 @@ class ChatBody(BaseModel):
     provider: str = ""                # per-turn provider override, paired with `model`
 
 
+# index.html is a single 100KB file served on every page load, so it is read
+# once and re-read only when it changes on disk — an editor save is picked up
+# without a restart, but a refresh loop does not re-read it 60 times.
+_INDEX_CACHE: dict = {"mtime": -1.0, "html": ""}
+# Both <script> blocks in index.html are bare opening tags; each needs the
+# nonce or the strict script-src drops it and the page is inert.
+_SCRIPT_OPEN_RE = re.compile(r"<script(?=[\s>])(?![^>]*\bnonce=)")
+
+
+def _index_html() -> str:
+    path = STATIC_DIR / "index.html"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return _INDEX_CACHE["html"]
+    if _INDEX_CACHE["mtime"] != mtime:
+        _INDEX_CACHE.update(mtime=mtime, html=path.read_text(encoding="utf-8"))
+    return _INDEX_CACHE["html"]
+
+
 @app.get("/")
-async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+async def index(request: Request):
+    nonce = getattr(request.state, "csp_nonce", "")
+    html = _SCRIPT_OPEN_RE.sub(f'<script nonce="{nonce}"', _index_html())
+    return HTMLResponse(html)
 
 
 # ── Health ───────────────────────────────────────────────────────────────
@@ -451,39 +684,187 @@ def _spawn(coro) -> asyncio.Task:
 # turn_id, ts}.
 TURNS: dict[str, dict] = {}
 _TURNS_MAX = 60
-TURNS_DIR = Path(os.environ.get("TURNS_DIR", "/tmp/hermes-webui-turns"))
-try:
-    TURNS_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:  # noqa: BLE001
-    pass
-TURN_KEY_RE = re.compile(r"[\w.-]{1,120}")
+
+# A turn key becomes a filename and is pasted into a `pkill -f` pattern, so
+# the character set is constrained and every entry point checks it. Without
+# that check a client-chosen session like "../../x" writes outside TURNS_DIR
+# and one containing regex metacharacters changes what /api/stop kills.
+#
+# The first character is narrower than the rest on purpose: it rules out "..",
+# dotfiles, and a leading "-" that a CLI could read as a flag. Keys the webui
+# generates look like "c_<base36>__<base36>", which fits comfortably.
+TURN_KEY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}")
+
+
+def _valid_turn_key(key: str) -> bool:
+    return bool(TURN_KEY_RE.fullmatch(key or ""))
+
+
+def _resolve_turns_dir() -> Path:
+    """Pick a writable directory for turn records, preferring a durable one.
+
+    The previous default lived under /tmp *inside the container*, so every
+    `docker compose up -d --build` threw away the records whose whole purpose
+    is outliving a restart. /app/state is a named volume in the shipped
+    compose file. The temp dir stays last in the list so a missing mount
+    degrades to the old behaviour rather than failing to start.
+    """
+    candidates: list[Path] = []
+    explicit = os.environ.get("TURNS_DIR", "").strip()
+    if explicit:
+        candidates.append(Path(explicit))
+    candidates.append(Path("/app/state/turns"))
+    candidates.append(Path(tempfile.gettempdir()) / "hermes-webui-turns")
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write-probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return path
+        except Exception:  # noqa: BLE001
+            continue
+    return candidates[-1]
+
+
+TURNS_DIR = _resolve_turns_dir()
+
+# Disk retention. The in-memory table is trimmed for footprint; disk keeps
+# more, since surviving a restart is the point — but not without limit. Before
+# this, records accumulated forever and nothing ever removed one.
+TURNS_MAX_FILES = int(os.environ.get("TURNS_MAX_FILES", "200"))
+TURNS_MAX_AGE_DAYS = float(os.environ.get("TURNS_MAX_AGE_DAYS", "7"))
+
+
+def _turn_path(key: str) -> Path | None:
+    return TURNS_DIR / f"{key}.json" if _valid_turn_key(key) else None
 
 
 def _persist_turn(key: str, rec: dict) -> None:
+    """Write a turn record atomically.
+
+    A plain write_text() leaves a truncated file behind if the process dies
+    mid-write, and at read time a truncated record is indistinguishable from a
+    lost one. Writing a sibling and renaming means a reader sees either the
+    previous record or the new one — never half of either.
+    """
+    path = _turn_path(key)
+    if path is None:
+        return
+    tmp = path.with_name(path.name + ".tmp")
     try:
-        (TURNS_DIR / f"{key}.json").write_text(json.dumps(rec), encoding="utf-8")
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        os.replace(tmp, path)
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _load_turn(key: str) -> dict | None:
+    path = _turn_path(key)
+    if path is None:
+        return None
     try:
-        return json.loads((TURNS_DIR / f"{key}.json").read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
     except Exception:  # noqa: BLE001
+        # Corrupt or unreadable — e.g. a truncation from before atomic writes.
+        # Drop it so it cannot shadow the recovery path on every later retry.
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
 
 def _drop_turn(key: str) -> None:
     TURNS.pop(key, None)
+    path = _turn_path(key)
+    if path is None:
+        return
     try:
-        (TURNS_DIR / f"{key}.json").unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     except Exception:  # noqa: BLE001
         pass
 
 
 def _trim_turns() -> None:
+    """Bound the in-memory table only. Disk is the durable copy and has its
+    own retention — see _prune_turn_files."""
     while len(TURNS) > _TURNS_MAX:
         TURNS.pop(next(iter(TURNS)))
+
+
+def _prune_turn_files(now: float | None = None) -> int:
+    """Delete records past the age or count limit. Returns how many went."""
+    now = time.time() if now is None else now
+    cutoff = now - TURNS_MAX_AGE_DAYS * 86400 if TURNS_MAX_AGE_DAYS > 0 else None
+    entries: list[tuple[float, Path]] = []
+    try:
+        for path in TURNS_DIR.glob("*.json"):
+            try:
+                entries.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        return 0
+    entries.sort(key=lambda e: e[0], reverse=True)     # newest first
+
+    removed = 0
+    for index, (mtime, path) in enumerate(entries):
+        too_many = TURNS_MAX_FILES > 0 and index >= TURNS_MAX_FILES
+        too_old = cutoff is not None and mtime < cutoff
+        if not (too_many or too_old):
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            pass
+
+    # Sweep stale .tmp siblings an interrupted write may have left. The age
+    # guard keeps this from racing a write that is legitimately in progress.
+    try:
+        for path in TURNS_DIR.glob("*.json.tmp"):
+            try:
+                if now - path.stat().st_mtime > 300:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return removed
+
+
+def _restore_turns() -> int:
+    """Reload persisted records into memory at startup.
+
+    Without this, a webui restart left TURNS empty, so a client reattaching to
+    a turn that was in flight hit the on-disk path with no turn_id in hand and
+    got told the turn failed — while the record sat on disk and, often, the
+    hermes process was still running in the agent container. Newest first,
+    capped at the in-memory limit.
+    """
+    try:
+        paths = sorted(TURNS_DIR.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:  # noqa: BLE001
+        return 0
+    restored = 0
+    for path in paths[:_TURNS_MAX]:
+        key = path.name[: -len(".json")]
+        rec = _load_turn(key)
+        if rec is None:
+            continue
+        # Records still marked "running" are left as-is: /api/turn re-checks
+        # liveness in the container, which is the only authority on whether
+        # the turn outlived this process.
+        TURNS.setdefault(key, rec)
+        restored += 1
+    return restored
 
 
 async def _kill_container_chat(session: str) -> None:
@@ -491,7 +872,9 @@ async def _kill_container_chat(session: str) -> None:
 
     Killing the local `docker exec` client does not reliably stop the process
     it spawned in the container, so we pkill it by its unique `--resume <key>`
-    command line. Session keys contain no regex metacharacters.
+    command line. `-f` takes a REGEX, so the key going into it must contain no
+    metacharacters — enforced by _valid_turn_key at every endpoint that
+    accepts one, not merely assumed.
     """
     try:
         p = await asyncio.create_subprocess_exec(
@@ -634,8 +1017,6 @@ async def _stream_chat(history: list[dict], message: str, session: str,
         yield sse("done", {})
         return
 
-    import time
-
     RUNNING[session] = proc
     captured: list[str] = []
     tasks: dict = {}
@@ -691,6 +1072,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
     async def read_stdout():
         """Drain stdout to the queue + record. Runs to completion even if the
         client detaches, then finalizes the record for /api/turn recovery."""
+        last_flush = 0.0
         try:
             assert proc.stdout is not None
             while True:
@@ -700,6 +1082,16 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
                 captured.append(line)
                 await q.put(("chunk", record("chunk", {"text": line})))
+                # Mirror the reply to disk as it arrives. The record used to be
+                # written only on poller ticks (which carry no chunks) and at
+                # completion, so a webui killed mid-reply lost every token it
+                # had already received. Throttled, because a fast model emits
+                # lines faster than it is worth rewriting the file.
+                now_ts = time.time()
+                if now_ts - last_flush >= 2.0:
+                    last_flush = now_ts
+                    rec["text"] = "\n".join(captured)
+                    _persist_turn(session, rec)
         except Exception:  # noqa: BLE001
             pass
         finally:
@@ -742,7 +1134,9 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             except Exception:  # noqa: BLE001
                 pass
 
-    reader = _spawn(read_stdout())
+    # Not bound to a name: _spawn already holds the strong reference (BG_TASKS)
+    # that keeps the task alive, and nothing here awaits the reader.
+    _spawn(read_stdout())
     poller = _spawn(poll_tools())
     tasks["poller"] = poller
     try:
@@ -793,7 +1187,6 @@ async def context_info():
     prompt budget (system prompt + skills + memory + tool schemas) that Hermes
     spends before the conversation even starts. Token counts are estimated at
     ~4 chars/token. Cached for 5 minutes."""
-    import time
 
     now = time.time()
     if CONTEXT_CACHE["data"] and now - CONTEXT_CACHE["ts"] < 300:
@@ -856,7 +1249,6 @@ async def models_info():
     through `-m <model> --provider <provider>` instead of waiting for the
     primary to fail first. Cached 5 minutes.
     """
-    import time
 
     now = time.time()
     if MODELS_CACHE["data"] and now - MODELS_CACHE["ts"] < 300:
@@ -1390,7 +1782,6 @@ async def mcp_status(refresh: int = 0):
     concurrently. `?refresh=1` forces a re-probe. The lock keeps a burst of
     clients — the UI polls this — from stacking N identical probe runs.
     """
-    import time
 
     now = time.time()
     if not refresh and MCP_CACHE["data"] and now - MCP_CACHE["ts"] < 60:
@@ -1496,7 +1887,6 @@ async def skills_info(refresh: int = 0):
     next turn" rather than "what happens to be installed on disk". Cached for
     5 minutes; the set only changes when a skill is installed or toggled.
     """
-    import time
 
     now = time.time()
     if not refresh and SKILLS_CACHE["data"] and now - SKILLS_CACHE["ts"] < 300:
@@ -1575,7 +1965,7 @@ async def turn(session: str):
     Only when every source comes up empty does it report failed=true, which
     the client renders as "Prompt processing failed."
     """
-    if not TURN_KEY_RE.fullmatch(session):
+    if not _valid_turn_key(session):
         return JSONResponse({"error": "bad turn key"}, status_code=400)
 
     rec = TURNS.get(session) or _load_turn(session)
@@ -1631,10 +2021,48 @@ async def turn(session: str):
 async def turn_ack(session: str):
     """Client confirms it received the turn's outcome; the record is dropped.
     Until acked, the record is kept so reconnects can replay it."""
-    if not TURN_KEY_RE.fullmatch(session):
+    if not _valid_turn_key(session):
         return JSONResponse({"error": "bad turn key"}, status_code=400)
     _drop_turn(session)
     return {"ok": True}
+
+
+@app.get("/api/turns")
+async def turns_index(limit: int = 40):
+    """Every unacked turn record still on disk, newest first.
+
+    This is the answer to "what survived?" after a webui or agent restart —
+    replies that completed while nobody was attached are held here until a
+    client acks them, and until now nothing could enumerate them: recovery
+    only worked if the client still remembered the session key it had used.
+    """
+    limit = max(1, min(limit, 200))
+    try:
+        paths = sorted(TURNS_DIR.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e), "turns": []}, status_code=500)
+
+    items: list[dict] = []
+    for path in paths[:limit]:
+        key = path.name[: -len(".json")]
+        rec = TURNS.get(key) or _load_turn(key)
+        if rec is None:
+            continue
+        text = (rec.get("text") or "").strip()
+        items.append({
+            "session": key,
+            "status": rec.get("status", "unknown"),
+            "code": rec.get("code"),
+            "started": rec.get("ts0"),
+            "updated": rec.get("ts"),
+            # Enough to recognise the conversation without shipping the whole
+            # transcript to a sidebar that only needs a label.
+            "preview": text[:180],
+            "chars": len(text),
+            "events": len(rec.get("events") or []),
+        })
+    return {"turns": items, "dir": str(TURNS_DIR), "total": len(paths)}
 
 
 @app.post("/api/chat")
@@ -1643,6 +2071,12 @@ async def chat(body: ChatBody):
     if not msg:
         return JSONResponse({"error": "empty message"}, status_code=400)
     session = body.session.strip() or "webui_default"
+    # The key names a file under TURNS_DIR and is interpolated into the
+    # `pkill -f` pattern /api/stop uses, so it is checked here rather than
+    # trusted: "../../x" would escape the records directory, and a regex
+    # metacharacter would widen what a later stop kills.
+    if not _valid_turn_key(session):
+        return JSONResponse({"error": "bad session key"}, status_code=400)
     return StreamingResponse(
         _stream_chat(body.history or [], msg, session, body.agent_mode,
                      body.model.strip(), body.provider.strip()),
@@ -1661,6 +2095,8 @@ async def stop(body: StopBody):
     session = body.session.strip()
     if not session:
         return JSONResponse({"error": "no session"}, status_code=400)
+    if not _valid_turn_key(session):
+        return JSONResponse({"error": "bad session key"}, status_code=400)
     proc = RUNNING.get(session)
     if proc is not None:
         try:
@@ -1673,8 +2109,21 @@ async def stop(body: StopBody):
     return {"ok": True, "had_local_process": proc is not None}
 
 
+def _startup() -> None:
+    """One-time setup for a real server start: report the access-control
+    posture, prune stale records, and reload the ones worth keeping."""
+    for warning in _audit_token_config():
+        print(f"WARNING: {warning}", flush=True)
+    pruned = _prune_turn_files()
+    restored = _restore_turns()
+    print(f"turn records: dir={TURNS_DIR} restored={restored} pruned={pruned}",
+          flush=True)
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    _startup()
 
     kwargs: dict = {}
     # WEBUI_TLS=1 serves HTTPS with the self-signed cert the entrypoint
