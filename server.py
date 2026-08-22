@@ -140,26 +140,114 @@ async def index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# ── Health ───────────────────────────────────────────────────────────────
+# "Is the container running?" is NOT the same question as "can the agent take
+# a turn?", and treating them as one is how the UI came to show a green light
+# through an outage: the agent container exited cleanly and was revived by its
+# restart policy, every in-flight turn died with it, and `{{.State.Running}}`
+# said "true" the whole way through.
+#
+# So the probe actually runs the CLI. That costs a process spawn (~1-2s), which
+# is too much for the UI's 15s poll, so the result is cached — the container
+# check is cheap and stays live, and the expensive proof of life refreshes on
+# its own schedule.
+AGENT_PROBE_CACHE: dict = {"ts": 0.0, "ready": False, "detail": "", "started_at": ""}
+AGENT_PROBE_TTL = 30.0
+AGENT_PROBE_TIMEOUT = 25.0
+
+
+async def _probe_agent_cli(started_at: str) -> tuple[bool, str]:
+    """Can the Hermes CLI in the container actually answer? Cached per TTL.
+
+    `hermes --version` is the cheapest call that proves the whole path works:
+    docker exec reaches the container, the interpreter starts, and the package
+    imports. A restart invalidates the cache immediately — the point of the
+    probe is to notice exactly that, so it must never answer from state that
+    predates it.
+    """
+    import time
+
+    now = time.time()
+    fresh = (now - AGENT_PROBE_CACHE["ts"] < AGENT_PROBE_TTL
+             and AGENT_PROBE_CACHE["started_at"] == started_at)
+    if fresh:
+        return AGENT_PROBE_CACHE["ready"], AGENT_PROBE_CACHE["detail"]
+
+    ready, detail = False, ""
+    try:
+        code, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "--version"), timeout=AGENT_PROBE_TIMEOUT)
+        first = (out or "").strip().splitlines()[0] if out.strip() else ""
+        ready = code == 0 and "hermes" in first.lower()
+        detail = first[:120] if ready else (out or "")[:200].replace("\n", " ")
+    except asyncio.TimeoutError:
+        detail = f"CLI did not answer within {int(AGENT_PROBE_TIMEOUT)}s"
+    except Exception as e:  # noqa: BLE001
+        detail = str(e)[:200]
+
+    AGENT_PROBE_CACHE.update(ts=now, ready=ready, detail=detail, started_at=started_at)
+    return ready, detail
+
+
 @app.get("/api/health")
 async def health():
-    """Report whether docker + the Hermes container are reachable."""
-    ok = False
-    detail = ""
+    """Whether the agent can actually take a turn — not merely whether its
+    container is running.
+
+    States the UI distinguishes:
+      ok        — container up AND the CLI answered.
+      degraded  — container up, CLI silent or erroring. Turns will fail; the
+                  old health check called this green.
+      offline   — container not running (or docker unreachable).
+
+    `started_at` is what lets the client notice a restart: it changes when the
+    container is recreated or revived by its restart policy, and any turn that
+    began before that timestamp cannot have survived.
+    """
+    running, started_at, restarts, exit_code, oom = "", "", 0, None, False
+    inspect_error = ""
     try:
         proc = await asyncio.create_subprocess_exec(
-            *_docker("inspect", "-f", "{{.State.Running}}", HERMES_CONTAINER),
+            *_docker("inspect", "-f",
+                     "{{.State.Running}}|{{.State.StartedAt}}|{{.RestartCount}}"
+                     "|{{.State.ExitCode}}|{{.State.OOMKilled}}",
+                     HERMES_CONTAINER),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         out, err = await proc.communicate()
-        detail = (out or err).decode(errors="replace").strip()
-        ok = detail == "true"
+        text = (out or err).decode(errors="replace").strip()
+        parts = text.split("|")
+        if len(parts) == 5:
+            running, started_at, restarts_s, exit_s, oom_s = parts
+            restarts = int(restarts_s) if restarts_s.isdigit() else 0
+            exit_code = int(exit_s) if exit_s.lstrip("-").isdigit() else None
+            oom = oom_s.strip().lower() == "true"
+        else:
+            inspect_error = text[:200]
     except Exception as e:  # noqa: BLE001
-        detail = str(e)
+        inspect_error = str(e)[:200]
+
+    container_up = running.strip().lower() == "true"
+    agent_ready, agent_detail = (False, inspect_error or "container is not running")
+    if container_up:
+        agent_ready, agent_detail = await _probe_agent_cli(started_at)
+
+    state = "ok" if (container_up and agent_ready) else ("degraded" if container_up else "offline")
     return {
-        "ok": ok,
+        # `ok` now means "usable", which is the whole point of this endpoint.
+        "ok": state == "ok",
+        "state": state,
         "container": HERMES_CONTAINER,
-        "running": detail,
+        # Kept as the raw inspect string for backwards compatibility with any
+        # client reading it; `state` is what to branch on.
+        "running": running or inspect_error,
+        "agent_ready": agent_ready,
+        "agent_detail": agent_detail,
+        "started_at": started_at,
+        "restart_count": restarts,
+        "last_exit_code": exit_code,
+        "oom_killed": oom,
         "docker_available": shutil.which(DOCKER_BIN) is not None or DOCKER_BIN == "docker",
     }
 
