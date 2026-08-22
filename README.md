@@ -114,6 +114,11 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_SYSTEM_PREAMBLE` | *(built-in default)* | Short context note prepended to every prompt so small local models use their tools instead of guessing their environment. Set to an empty string to disable |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
+| `WEBUI_AUTH_MAX_FAILURES` | `10` | Bad tokens from one IP before it is locked out |
+| `WEBUI_AUTH_LOCKOUT_SECONDS` | `60` | How long that lockout lasts |
+| `TURNS_DIR` | `/app/state/turns` | Where turn records are kept. Falls back to a temp dir if unwritable |
+| `TURNS_MAX_FILES` | `200` | Turn records to keep on disk (`0` = no limit) |
+| `TURNS_MAX_AGE_DAYS` | `7` | Age at which a record is pruned (`0` = never) |
 
 ### System preamble
 
@@ -122,15 +127,23 @@ questions from a hallucinated self-image ("I'm a WSL instance, files are under
 `/mnt/c`…") instead of actually running a tool. To counter this, the webui
 prepends a short context note to every prompt:
 
-> You are running inside a Linux container (not WSL). The user's Obsidian vault
-> is bind-mounted read-write at `/host/MyVault`. Always use your tools to
-> inspect or modify the filesystem — never guess about your environment or where
-> files live.
+> You are running inside a Linux container (not WSL). Always use your tools to
+> inspect the filesystem and find where things actually live — never guess about
+> your environment or the location of files.
 
 The note rides at the **top of the composed prompt** (ahead of the injected
 conversation history) and never appears in the chat — you only see your own
-messages and the reply. Override it with `HERMES_SYSTEM_PREAMBLE` (e.g. to point
-at a different vault path), or set it empty to turn it off.
+messages and the reply. Override it with `HERMES_SYSTEM_PREAMBLE`, or set it
+empty to turn it off.
+
+**It names no paths on purpose.** If you tell the model a directory exists and
+it doesn't, that assertion outranks what the tools report: the model spends the
+turn trying to reconcile the missing path instead of just looking. Add a path
+here only if it exists *inside the agent container*, and check it first:
+
+```bash
+docker exec hermes-agent ls /host
+```
 
 Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
 
@@ -250,7 +263,28 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
 | `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider,context_length,max_tokens}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain in order. Cached 5 min |
 | `GET`  | `/api/mcp` | MCP servers, health and discovered tools: `{servers:[{name,transport,target,state,connected,connect_ms,detail,tools,selected_tools,selected_prefixed,env_refs,missing_env}], summary}`. `?refresh=1` forces a re-probe. Cached 60s |
+| `GET`  | `/api/turns` | Every unacked turn record still on disk, newest first: `{turns:[{session,status,preview,chars,events,started,updated}], dir, total}`. What survived a restart |
 | `GET`  | `/api/skills` | Skills enabled for the next turn: `{skills:[{name,category,source,trust,status}], total, categories, sources}`. Names only — no `SKILL.md` is ever read. `?refresh=1` bypasses the 5 min cache |
+
+## Turn records
+
+Mobile clients drop constantly — a locked phone, a backgrounded browser, a wifi
+blip. So the server, not the SSE stream, is the source of truth for a turn: every
+event is recorded and mirrored to disk, and a reconnecting client replays the
+record instead of losing the reply. `/api/turn/{session}` is the reattach point;
+`/api/turns` lists what is being held.
+
+Records live in a **named Docker volume** (`hermes-webui-state` → `/app/state`).
+This matters: they used to sit under `/tmp` *inside the container*, so every
+`docker compose up -d --build` silently discarded them — which defeats the point
+of persisting them. If you are upgrading from an older checkout, the new volume
+starts empty; nothing is migrated.
+
+Writes are atomic (staged to a sibling file, then renamed), so a webui killed
+mid-write leaves the previous record intact rather than a truncated one. The
+reply text is flushed to disk as it streams, not only at completion. Retention
+is bounded by `TURNS_MAX_FILES` and `TURNS_MAX_AGE_DAYS`; a record is deleted
+outright once the client acks it.
 
 ## MCP servers
 
@@ -361,7 +395,21 @@ exactly that reason.
   access (including yolo file writes) to whoever reaches the port. With a token
   set, every `/api/*` request must carry `Authorization: Bearer <token>`; the
   browser shows a lock screen once and remembers the token. Generate one with
-  `openssl rand -hex 24`.
+  `openssl rand -hex 24`. The server prints a warning at startup if the token
+  is missing, too short, or travelling without TLS.
+- **Failed logins are throttled.** The token is one shared secret with no
+  account behind it, so an unthrottled endpoint is a plain guessing oracle.
+  After `WEBUI_AUTH_MAX_FAILURES` bad tokens an IP is refused with `429` for
+  `WEBUI_AUTH_LOCKOUT_SECONDS`. `X-Forwarded-For` is deliberately ignored —
+  honouring it would let one client mint a fresh identity per guess.
+- **Responses carry a strict CSP.** `script-src` uses a per-response nonce and
+  no `'unsafe-inline'`, so an injected `<script>` or `onerror=` handler cannot
+  execute; `connect-src 'self'` means an exfiltration beacon has nowhere to
+  send. This matters because the chat pane renders model output as HTML, and
+  that output routinely quotes web pages and files the agent just read.
+  Alongside it: `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
+  no-referrer`, a restrictive `Permissions-Policy`, `no-store` on `/api/*`,
+  and HSTS when `WEBUI_TLS=1`.
 - **Enable `WEBUI_TLS=1` on semi-public LANs.** Plain HTTP exposes the token
   and chat content to sniffing/MITM. With TLS on, the container generates a
   self-signed cert at first start (kept inside the container) and serves
@@ -380,15 +428,39 @@ exactly that reason.
   or use an SSH tunnel. An LM Studio *client* install cannot act as a relay
   for other apps.
 
+## Tests
+
+The suite is hermetic — it never spawns a real subprocess and never needs the
+agent container running, so it takes under a second. A test that reaches for
+docker fails loudly rather than quietly shelling out.
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+```
+
+```bash
+.venv/bin/pytest
+```
+
+Coverage is aimed at the two places bugs actually live: the parsers that scrape
+Hermes' human-readable CLI output (no `--json` mode exists, so an upstream
+formatting change breaks them silently), and the access-control and persistence
+paths, where a failure is invisible until it matters.
+
+Nothing here ships in the image — the Dockerfile installs `requirements.txt`
+alone, so the runtime stays at four packages.
+
 ## Project layout
 
 ```
 hermes-webui/
 ├── server.py            # FastAPI backend (exec into Hermes, stream SSE)
 ├── static/index.html    # Single-file chat UI (no external deps)
+├── tests/               # pytest suite (dev only — not in the image)
 ├── Dockerfile           # python:3.12-slim + docker-ce-cli
 ├── docker-compose.yml
 ├── requirements.txt
+├── requirements-dev.txt
 └── .env.example
 ```
 
