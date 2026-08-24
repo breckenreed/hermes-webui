@@ -115,6 +115,15 @@
   #sessearch:focus{border-color:var(--accent)}
   #seslabel{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.8px;padding:4px 16px}
   .sesempty{color:var(--dim);font-size:12.5px;padding:10px 10px;font-family:var(--mono)}
+  .sesgroup{display:flex;align-items:center;gap:6px;width:100%;background:none;border:none;
+    color:var(--muted);font-family:var(--mono);font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.7px;padding:10px 10px 4px;cursor:pointer;text-align:left}
+  .sesgroup:hover{color:var(--accent2)}
+  .sesgroup .caret{display:inline-block;transition:transform .12s;font-size:9px}
+  .sesgroup.closed .caret{transform:rotate(-90deg)}
+  .sesgroup .n{margin-left:auto;opacity:.7}
+  .ses .pin{position:absolute;top:8px;right:26px;font-size:10px;color:var(--accent2);opacity:.85}
+  .ses.pinned .t{padding-right:44px}
   #sessions{flex:1;overflow-y:auto;padding:0 8px 12px}
   .ses{position:relative;padding:9px 10px;border-radius:7px;cursor:pointer;margin-bottom:2px;border:1px solid transparent}
   .ses:hover{background:var(--panel2)}
@@ -1027,31 +1036,95 @@ function matchesQuery(c, q){
   return (c.title || "").toLowerCase().includes(q) || searchBlob(c.id).includes(q);
 }
 
+/* ---------- sidebar grouping ----------
+   A flat list ordered by recency means a conversation you return to daily
+   sinks the moment you start something new, and "the one from yesterday" is
+   only findable by scrolling. Pinning fixes the first; date groups fix the
+   second. */
+const GROUPS_LS = "hermes_groups_closed";
+let closedGroups = new Set(readJSON(GROUPS_LS, []));
+
+function toggleGroup(key){
+  if(closedGroups.has(key)) closedGroups.delete(key); else closedGroups.add(key);
+  writeJSON(GROUPS_LS, [...closedGroups]);
+  renderConvos();
+}
+
+/* Day boundaries are built with the Date constructor rather than by
+   subtracting 86400000: across a DST change a day is 23 or 25 hours long, and
+   fixed arithmetic puts "yesterday" an hour into the wrong day twice a year. */
+function dayBucket(ts){
+  if(!ts) return "earlier";
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime();
+  if(ts >= startOfToday) return "today";
+  if(ts >= startOfYesterday) return "yesterday";
+  return "earlier";
+}
+
+const GROUP_LABELS = {pinned:"Pinned", today:"Today", yesterday:"Yesterday", earlier:"Earlier"};
+
+function sesRow(c){
+  const el=document.createElement("div");
+  el.className="ses"+(c.id===activeId?" active":"")+(c.pinned?" pinned":"");
+  el.innerHTML=`<div class="t">${esc(c.title||"(untitled)")}</div>`+
+    `<div class="m">${esc(timeago(c.updated))}</div>`+
+    (c.pinned?`<span class="pin" title="Pinned">\u{1F4CC}</span>`:"")+
+    `<button class="dots" title="Actions">⋯</button>`;
+  el.onclick=()=>{ openConvo(c.id); };
+  el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, c); };
+  return el;
+}
+
 function renderConvos(){
   const box = $("#sessions"); box.innerHTML="";
   const q = sessionQuery.trim().toLowerCase();
-  const list = q ? convos.filter(c => matchesQuery(c, q)) : convos;
-  // The label doubles as the result count — a filtered list that still says
-  // "Recent sessions" looks like conversations went missing.
-  $("#seslabel").textContent = q
-    ? `${list.length} match${list.length===1?"":"es"}`
-    : "Recent sessions";
-  if(q && !list.length){
-    const none=document.createElement("div"); none.className="sesempty";
-    none.textContent="No conversations match.";
-    box.append(none);
+
+  if(q){
+    // Search results are a different view from browsing: date headers and a
+    // pinned section are organisation you did not ask for while looking for
+    // one specific thing, and the count in the label already says how it went.
+    const hits = convos.filter(c => matchesQuery(c, q));
+    $("#seslabel").textContent = `${hits.length} match${hits.length===1?"":"es"}`;
+    if(!hits.length){
+      const none=document.createElement("div"); none.className="sesempty";
+      none.textContent="No conversations match.";
+      box.append(none);
+      return;
+    }
+    hits.forEach(c=> box.append(sesRow(c)));
     return;
   }
-  list.forEach(c=>{
-    const el=document.createElement("div"); el.className="ses"+(c.id===activeId?" active":"");
-    el.innerHTML=`<div class="t">${esc(c.title||"(untitled)")}</div>`+
-      `<div class="m">${esc(timeago(c.updated))}</div>`+
-      `<button class="dots" title="Actions">⋯</button>`;
-    el.onclick=()=>{ openConvo(c.id); };
-    el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, c); };
-    box.append(el);
+
+  $("#seslabel").textContent = "Recent sessions";
+  const buckets = {pinned:[], today:[], yesterday:[], earlier:[]};
+  convos.forEach(c => buckets[c.pinned ? "pinned" : dayBucket(c.updated)].push(c));
+
+  ["pinned","today","yesterday","earlier"].forEach(key=>{
+    const items = buckets[key];
+    if(!items.length) return;
+    const closed = closedGroups.has(key);
+    const head=document.createElement("button");
+    head.className="sesgroup"+(closed?" closed":"");
+    head.type="button";
+    head.innerHTML=`<span class="caret">▾</span><span>${GROUP_LABELS[key]}</span>`
+                  +`<span class="n">${items.length}</span>`;
+    head.onclick=()=>toggleGroup(key);
+    box.append(head);
+    if(!closed) items.forEach(c=> box.append(sesRow(c)));
   });
 }
+
+/* Groups are computed at render time, but a sidebar left open overnight never
+   re-renders on its own — "Today" would quietly keep meaning yesterday. This
+   fires once at the next local midnight and then reschedules itself. */
+function scheduleMidnightRefresh(){
+  const now = new Date();
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 5);
+  setTimeout(()=>{ renderConvos(); scheduleMidnightRefresh(); }, next - now);
+}
+scheduleMidnightRefresh();
 
 /* ---------- session context menu ---------- */
 let openMenuEl=null;
@@ -1063,6 +1136,7 @@ function openMenu(anchor, s){
   closeMenu();
   const m=document.createElement("div"); m.className="menu";
   m.innerHTML=
+    `<button data-a="pin">${s.pinned ? "\u{1F4CC} Unpin" : "\u{1F4CC} Pin to top"}</button>`+
     `<button data-a="rename">✎ Rename</button>`+
     `<button data-a="duplicate">⎘ Duplicate</button>`+
     `<button data-a="copy">⧉ Copy ID</button>`+
@@ -1078,7 +1152,8 @@ function openMenu(anchor, s){
   m.addEventListener("click", e=>e.stopPropagation());
   m.querySelectorAll("button").forEach(b=>{
     b.onclick=()=>{ const a=b.dataset.a; closeMenu();
-      if(a==="rename") renameConvo(s);
+      if(a==="pin") togglePin(s);
+      else if(a==="rename") renameConvo(s);
       else if(a==="duplicate") duplicateConvo(s);
       else if(a==="copy"){ copyText(s.id).then(ok=> toast(ok ? "Conversation ID copied" : "Couldn't copy — no clipboard access")); }
       else if(a==="md") exportMarkdown(s);
@@ -1293,6 +1368,18 @@ function duplicateConvo(c){
   toast(isBusy(c.id)
     ? "Duplicated — the reply still running in the original isn't included"
     : `Duplicated ${src.length} message${src.length === 1 ? "" : "s"}`);
+}
+
+function togglePin(c){
+  // Mutating the stored object rather than rebuilding the list: touchConvo
+  // moves this same object to the front on every turn, so the flag rides
+  // along with it instead of being reset by the next message.
+  const entry = convos.find(x => x.id === c.id);
+  if(!entry) return;
+  entry.pinned = !entry.pinned;
+  writeJSON(CONVOS_LS, convos);
+  renderConvos();
+  toast(entry.pinned ? "Pinned to the top" : "Unpinned");
 }
 
 function renameConvo(c){
