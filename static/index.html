@@ -200,6 +200,14 @@
   /* Per-message actions. Always rendered rather than revealed on hover: this
      UI is used from a phone as much as a desktop, and a hover-only control
      does not exist on a touch screen. */
+  .codewrap{position:relative}
+  /* Always visible, not revealed on hover: a hover-only control does not exist
+     on a phone, and this transcript is read from one as often as not. */
+  .copybtn{position:absolute;top:6px;right:6px;background:var(--panel2);
+           border:1px solid var(--border);color:var(--dim);cursor:pointer;
+           font-family:var(--mono);font-size:10.5px;padding:3px 7px;border-radius:5px}
+  .copybtn:hover{color:var(--accent2)}
+  .copybtn.done{color:var(--accent2);border-color:var(--accent2)}
   .msgacts{display:flex;gap:6px;margin-top:8px}
   .mact{background:none;border:1px solid transparent;color:var(--dim);cursor:pointer;
         font-family:var(--mono);font-size:11px;padding:3px 7px;border-radius:5px}
@@ -654,7 +662,12 @@ function renderMarkdown(src){
     if(i%2===1){ // fenced code
       const nl=b.indexOf("\n");
       const code = nl>=0 ? b.slice(nl+1) : b;
-      html += `<pre><code>${esc(code.replace(/\n$/,""))}</code></pre>`;
+      // No data attribute carrying the code: the button reads its sibling's
+      // textContent at click time, which sidesteps escaping the code into an
+      // attribute and back — and the round trip is where the copied text stops
+      // matching what is on screen.
+      html += `<div class="codewrap"><button class="copybtn" type="button">Copy</button>`
+            + `<pre><code>${esc(code.replace(/\n$/,""))}</code></pre></div>`;
     } else {
       html += renderInline(b);
     }
@@ -912,6 +925,19 @@ function addMsg(role){
   return body;
 }
 
+/* Delegated: the transcript is rebuilt wholesale on every render (and during
+   a turn, on every recovery poll), so per-button listeners would be attached
+   and thrown away continuously. */
+messagesEl.addEventListener("click", async (e)=>{
+  const btn=e.target.closest && e.target.closest(".copybtn");
+  if(!btn) return;
+  const code=btn.parentElement.querySelector("code");
+  const ok=await copyText(code ? code.textContent : "");
+  btn.textContent = ok ? "Copied" : "No clipboard";
+  btn.classList.toggle("done", ok);
+  setTimeout(()=>{ btn.textContent="Copy"; btn.classList.remove("done"); }, 1400);
+});
+
 /* ---------- scroll anchoring ----------
    The transcript used to be yanked to the bottom on EVERY repaint, and while a
    turn is running that means every streamed chunk, every tool event and every
@@ -993,11 +1019,38 @@ function openMenu(anchor, s){
     b.onclick=()=>{ const a=b.dataset.a; closeMenu();
       if(a==="rename") renameConvo(s);
       else if(a==="duplicate") duplicateConvo(s);
-      else if(a==="copy"){ navigator.clipboard.writeText(s.id).then(()=>toast("Conversation ID copied")); }
+      else if(a==="copy"){ copyText(s.id).then(ok=> toast(ok ? "Conversation ID copied" : "Couldn't copy — no clipboard access")); }
       else if(a==="delete") deleteConvo(s);
     };
   });
   openMenuEl=m;
+}
+
+/* ---------- clipboard ----------
+   navigator.clipboard only exists on a SECURE origin. This webui is routinely
+   reached over plain http by LAN IP or through a tunnel — that is why
+   WEBUI_TLS exists at all — so on exactly the setups people use most, the
+   modern API is undefined and the obvious one-liner throws. The deprecated
+   execCommand path still works there, so it is the fallback rather than an
+   afterthought. */
+async function copyText(text){
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  }catch(e){ /* fall through — permission denied, or no clipboard at all */ }
+  try{
+    const ta=document.createElement("textarea");
+    ta.value=text;
+    // Off-screen rather than hidden: a display:none element cannot be selected.
+    ta.style.cssText="position:fixed;top:-1000px;left:-1000px;opacity:0";
+    document.body.append(ta);
+    ta.select();
+    const ok=document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }catch(e){ return false; }
 }
 
 function toast(msg){
@@ -1152,17 +1205,33 @@ function attachMsgActions(body, m, i){
   // both are about to rewrite the very history these buttons would slice, and
   // the streamed bubble is not a stored message yet.
   if(i===undefined || isBusy(activeId) || compacting.has(activeId)) return;
-  const isLastAssistant = m.role!=="user" && m.role!=="compact"
+  if(m.role==="compact") return;
+  const isLastAssistant = m.role!=="user"
                           && !messages.slice(i+1).some(x=>x.role!=="user");
-  if(m.role!=="user" && !isLastAssistant) return;
+  const buttons=[];
+  if(m.role==="user"){
+    buttons.push(`<button class="mact" data-a="edit" title="Edit this message and regenerate everything after it">✎ Edit</button>`);
+  }else{
+    // Copy on every reply, not only the last one — an answer from earlier in
+    // the conversation is the one you most often want to take somewhere else.
+    buttons.push(`<button class="mact" data-a="copytext" title="Copy this reply as Markdown">⧉ Copy</button>`);
+    if(isLastAssistant) buttons.push(`<button class="mact" data-a="retry" title="Discard this reply and ask again">⟲ Retry</button>`);
+  }
   const acts=document.createElement("div"); acts.className="msgacts";
-  acts.innerHTML = m.role==="user"
-    ? `<button class="mact" data-a="edit" title="Edit this message and regenerate everything after it">✎ Edit</button>`
-    : `<button class="mact" data-a="retry" title="Discard this reply and ask again">⟲ Retry</button>`;
-  acts.onclick=(e)=>{
-    const a=e.target.dataset && e.target.dataset.a;
+  acts.innerHTML=buttons.join("");
+  acts.onclick=async (e)=>{
+    const el=e.target.closest && e.target.closest(".mact");
+    const a=el && el.dataset.a;
     if(a==="edit") startEdit(body, m, i, activeId);
     else if(a==="retry") retryLast(activeId);
+    else if(a==="copytext"){
+      // m.text is the Markdown the model produced. Copying the rendered HTML
+      // instead would paste a wall of tags, and copying the DOM's text would
+      // lose the fences and tables that make the reply readable elsewhere.
+      const ok=await copyText(m.text||"");
+      el.textContent = ok ? "Copied" : "No clipboard";
+      setTimeout(()=>{ el.textContent="⧉ Copy"; }, 1400);
+    }
   };
   body.append(acts);
 }
