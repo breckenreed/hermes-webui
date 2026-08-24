@@ -3,6 +3,8 @@
 A tiny, self-contained **web chat interface for a local [Hermes Agent](https://hermes-agent.nousresearch.com) container** — think "claude-code mini" for Hermes. Command your local agent from the browser: send prompts, watch tool calls stream, and browse/resume past sessions.
 
 ![status](https://img.shields.io/badge/hermes-webui-e07b39)
+[![tests](https://github.com/breckenreed/hermes-webui/actions/workflows/tests.yml/badge.svg)](https://github.com/breckenreed/hermes-webui/actions/workflows/tests.yml)
+[![docker-smoke](https://github.com/breckenreed/hermes-webui/actions/workflows/docker-smoke.yml/badge.svg)](https://github.com/breckenreed/hermes-webui/actions/workflows/docker-smoke.yml)
 
 ## What it does
 
@@ -572,6 +574,14 @@ exactly that reason.
   for other apps.
 
 ## Tests
+
+Every push and pull request runs them on GitHub Actions —
+[`tests.yml`](.github/workflows/tests.yml) on Python 3.12 (what the image
+ships) and 3.13 (what development runs on), plus
+[`docker-smoke.yml`](.github/workflows/docker-smoke.yml), which builds the
+image and checks the container actually serves. The unit suite never touches
+the Dockerfile or the entrypoint, so without that second job a broken base
+image or a botched entrypoint would ship behind a green test run.
 
 The suite is hermetic — it never spawns a real subprocess and never needs the
 agent container running, so it takes under a second. A test that reaches for
