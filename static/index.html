@@ -197,6 +197,19 @@
   .tool.switch{border-left-color:var(--amber);color:var(--amber);font-weight:600}
   .tool .ts{color:var(--dim)}
   .msgtime{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:6px}
+  /* Per-message actions. Always rendered rather than revealed on hover: this
+     UI is used from a phone as much as a desktop, and a hover-only control
+     does not exist on a touch screen. */
+  .msgacts{display:flex;gap:6px;margin-top:8px}
+  .mact{background:none;border:1px solid transparent;color:var(--dim);cursor:pointer;
+        font-family:var(--mono);font-size:11px;padding:3px 7px;border-radius:5px}
+  .mact:hover{color:var(--accent2);border-color:var(--border);background:var(--panel2)}
+  .mact.primary{color:var(--accent2);border-color:var(--border)}
+  .editbox{width:100%;box-sizing:border-box;background:var(--panel2);color:var(--text);
+           border:1px solid var(--accent);border-radius:8px;padding:10px 12px;
+           font-family:inherit;font-size:14.5px;line-height:1.6;resize:none;outline:none}
+  .editbar{display:flex;gap:6px;margin-top:8px;align-items:center}
+  .editbar .hintk{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-left:auto}
   /* /compact anchor: deliberately unlike a message bubble — it is not something
      anyone said, it is the conversation's own older turns folded up. Collapsed
      by default so it reads as a marker, expandable because the user has every
@@ -871,7 +884,7 @@ function renderConversation(){
   // scrolled up got thrown to the TOP of the transcript on every tick.
   const prevTop = chatEl.scrollTop;
   messagesEl.innerHTML="";
-  messages.forEach(m=> renderMessage(m.role, m.text, m.tools, m.ts, m));
+  messages.forEach((m,i)=> renderMessage(m, i));
   // Lives in the render pass, not as a one-off DOM node: a compaction takes a
   // whole model turn, and switching away and back (or any re-render) would
   // otherwise wipe the only sign that anything is happening.
@@ -1118,14 +1131,99 @@ function switchLine(from, to, ts){
 }
 
 /* render a full transcript message (with optional tool lines + a time footer) */
-function renderMessage(role, text, tools, ts, m){
-  if(role==="compact"){ renderCompactAnchor(text, ts, m); return; }
-  const body=addMsg(role==="user"?"user":"assistant");
+function renderMessage(m, i){
+  if(m.role==="compact"){ renderCompactAnchor(m.text, m.ts, m); return; }
+  const body=addMsg(m.role==="user"?"user":"assistant");
   let html="";
-  (tools||[]).forEach(t=> html+=toolHtml(t));
-  if(text) html += renderMarkdown(text);
-  if(ts && role!=="user") html += `<div class="msgtime">${fmtClock(ts)}</div>`;
+  (m.tools||[]).forEach(t=> html+=toolHtml(t));
+  if(m.text) html += renderMarkdown(m.text);
+  if(m.ts && m.role!=="user") html += `<div class="msgtime">${fmtClock(m.ts)}</div>`;
   body.innerHTML=html;
+  attachMsgActions(body, m, i);
+}
+
+/* ---------- per-message actions ----------
+   Both actions are the same primitive: truncate the conversation to a point
+   and send from there. That works here precisely because the webui owns the
+   conversation — there is no server-side chat to rewind, just an array in
+   localStorage, so "regenerate from message N" costs nothing but a slice. */
+function attachMsgActions(body, m, i){
+  // Nothing is offered while this conversation is mid-turn or mid-compaction:
+  // both are about to rewrite the very history these buttons would slice, and
+  // the streamed bubble is not a stored message yet.
+  if(i===undefined || isBusy(activeId) || compacting.has(activeId)) return;
+  const isLastAssistant = m.role!=="user" && m.role!=="compact"
+                          && !messages.slice(i+1).some(x=>x.role!=="user");
+  if(m.role!=="user" && !isLastAssistant) return;
+  const acts=document.createElement("div"); acts.className="msgacts";
+  acts.innerHTML = m.role==="user"
+    ? `<button class="mact" data-a="edit" title="Edit this message and regenerate everything after it">✎ Edit</button>`
+    : `<button class="mact" data-a="retry" title="Discard this reply and ask again">⟲ Retry</button>`;
+  acts.onclick=(e)=>{
+    const a=e.target.dataset && e.target.dataset.a;
+    if(a==="edit") startEdit(body, m, i, activeId);
+    else if(a==="retry") retryLast(activeId);
+  };
+  body.append(acts);
+}
+
+// Shared guard: the two ways this conversation's history can be busy being
+// rewritten by something else.
+function canRewrite(id){
+  if(isBusy(id)){ toast("A turn is running here — stop it or wait for it"); return false; }
+  if(compacting.has(id)){ toast("Compacting this conversation — one moment"); return false; }
+  return true;
+}
+
+// Drop everything from `index` on, then send `text` as a fresh turn. send()
+// re-appends the user message and rebuilds the history from what is left, so
+// the result is the original turn re-run — with a new turn key, so the record
+// and recovery path stay correct.
+function resendFrom(id, index, text){
+  saveMsgs(id, loadMsgs(id).slice(0, index));
+  if(id===activeId){ renderConversation(); updateCtxMeter(); }
+  send({text, convoId:id});
+}
+
+function retryLast(forId){
+  const id=forId||activeId;
+  if(!canRewrite(id)) return;
+  const msgs=loadMsgs(id);
+  // Walk back to the message being answered. Scanning for the last USER turn
+  // (rather than assuming the reply sits at the end) also covers a transcript
+  // whose tail is a tool-only or empty assistant entry.
+  let i=msgs.length-1;
+  while(i>=0 && msgs[i].role!=="user") i--;
+  if(i<0){ toast("Nothing to retry"); return; }
+  resendFrom(id, i, msgs[i].text);
+}
+
+function startEdit(body, m, i, id){
+  if(!canRewrite(id)) return;
+  const ta=document.createElement("textarea"); ta.className="editbox"; ta.value=m.text||"";
+  const bar=document.createElement("div"); bar.className="editbar";
+  bar.innerHTML=`<button class="mact primary" data-a="save">Save &amp; regenerate</button>`
+              + `<button class="mact" data-a="cancel">Cancel</button>`
+              + `<span class="hintk">Enter to save · Esc to cancel</span>`;
+  body.innerHTML=""; body.append(ta, bar);
+  const grow=()=>{ ta.style.height="auto"; ta.style.height=Math.min(ta.scrollHeight,400)+"px"; };
+  grow(); ta.addEventListener("input", grow);
+  ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length);
+  const cancel=()=>renderConversation();
+  const save=()=>{
+    const t=ta.value.trim();
+    if(!t){ toast("An empty message can't be sent"); return; }
+    if(t===(m.text||"").trim()){ cancel(); return; }   // nothing changed — don't burn a turn
+    resendFrom(id, i, t);
+  };
+  bar.onclick=(e)=>{
+    const a=e.target.dataset && e.target.dataset.a;
+    if(a==="save") save(); else if(a==="cancel") cancel();
+  };
+  ta.addEventListener("keydown",e=>{
+    if(e.key==="Escape"){ e.preventDefault(); cancel(); }
+    else if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); save(); }
+  });
 }
 
 function renderCompactAnchor(text, ts, m){
@@ -1441,10 +1539,19 @@ async function send(arg){
   const history = msgs.map(m=>({role:m.role, text:m.text}));
 
   if(!isAuto){
-    const firstUser = !msgs.some(m=>m.role==="user");
+    // Auto-title only a conversation that has never had a name. Editing the
+    // FIRST message truncates the history to empty, which looks identical to a
+    // brand-new chat — and would silently overwrite a title the user had set
+    // by hand with the text of whatever they just edited.
+    const named = convos.some(x=>x.id===forConvo && x.title);
+    const autoTitle = !named && !msgs.some(m=>m.role==="user");
     msgs=[...msgs, {role:"user", text:displayText, tools:[]}];
     saveMsgs(forConvo, msgs);
-    touchConvo(forConvo, firstUser ? displayText.slice(0,60) : null);
+    // The meter counts stored messages, so it has to be told about the one
+    // just appended — otherwise it reads "+0" for the whole turn and only
+    // catches up when the reply lands.
+    if(isActive()) updateCtxMeter();
+    touchConvo(forConvo, autoTitle ? displayText.slice(0,60) : null);
     if(isActive()){
       const userBody=addMsg("user"); userBody.innerHTML=renderMarkdown(displayText);
       // Sending is an explicit "I'm done reading back" — go to the end even if
@@ -1611,7 +1718,12 @@ async function send(arg){
     cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now()}];
     saveMsgs(forConvo, cur);
     touchConvo(forConvo, null); renderConvos();
-    if(isActive()){ repaint(); updateCtxMeter(); if(!isAuto) $("#input").focus(); }
+    // renderConversation, not repaint: repaint only rewrites the streaming
+    // bubble, which is not a stored message and so carries no Retry control
+    // (and still holds the cursor span). Rebuilding from storage turns the
+    // finished turn into an ordinary, actionable message. Scroll position and
+    // stick-to-bottom are preserved by renderConversation itself.
+    if(isActive()){ renderConversation(); updateCtxMeter(); if(!isAuto) $("#input").focus(); }
 
     if(interrupted){
       recoverPending(forConvo);          // start re-asking the server right away
@@ -2162,6 +2274,19 @@ input.addEventListener("input",()=>{
 input.addEventListener("keydown",e=>{
   if(handleSlashMenuKey(e)) return;
   if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendFromComposer(); }
+  // ↑ on an empty box recalls the last thing you sent, shell-style. Only when
+  // empty, so it never fights with moving the caret through a draft. This
+  // sends a NEW message when submitted — to change history in place, use Edit
+  // on the message itself.
+  else if(e.key==="ArrowUp" && !input.value){
+    const last=[...messages].reverse().find(m=>m.role==="user" && (m.text||"").trim());
+    if(last){
+      e.preventDefault();
+      input.value=last.text;
+      input.dispatchEvent(new Event("input"));
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+  }
 });
 input.addEventListener("blur",()=>setTimeout(closeSlashMenu,150));   // allow a menu click to register first
 $("#newchat").onclick=()=>{ newConvo(); };
