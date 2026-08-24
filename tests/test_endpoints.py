@@ -369,3 +369,156 @@ class TestStop:
 
     def test_rejects_an_empty_session(self, client):
         assert client.post("/api/stop", json={"session": "  "}).status_code == 400
+
+
+class TestCompact:
+    """/api/compact folds a conversation into notes the client swaps in.
+
+    The failure that matters here is not a bad summary — it is a compaction
+    that reports success while returning nothing usable, because the client
+    then replaces real history with it.
+    """
+
+    HISTORY = [
+        {"role": "user", "text": "set up the deploy"},
+        {"role": "assistant", "text": "installed it at /opt/app"},
+        {"role": "user", "text": "now add TLS"},
+    ]
+    SUMMARY = ("goal: deploy the app and put TLS in front of it\n"
+               "done: installed at /opt/app\n"
+               "open: TLS not configured yet")
+
+    def test_returns_the_summary(self, client, fake_run):
+        fake_run(self.SUMMARY)
+        body = client.post("/api/compact", json={"history": self.HISTORY}).json()
+        assert body["summary"] == self.SUMMARY
+        assert body["turns"] == 3
+
+    def test_the_prompt_carries_the_history_and_the_directive(self, client, fake_run,
+                                                              monkeypatch):
+        monkeypatch.setattr(server, "COMPACT_DIRECTIVE", "SUMMARIZE-DIRECTIVE")
+        fake_run(self.SUMMARY)
+        client.post("/api/compact", json={"history": self.HISTORY})
+        prompt = fake_run.calls[0][fake_run.calls[0].index("-z") + 1]
+        assert "User: set up the deploy" in prompt
+        assert "Assistant: installed it at /opt/app" in prompt
+        assert "SUMMARIZE-DIRECTIVE" in prompt
+
+    def test_no_reply_framing_leaks_into_the_compaction_prompt(self, client, fake_run):
+        """The chat prompt ends by telling the model to answer the user. A
+        compaction that inherited that framing answers the last message
+        instead of summarizing the conversation."""
+        fake_run(self.SUMMARY)
+        client.post("/api/compact", json={"history": self.HISTORY})
+        prompt = fake_run.calls[0][fake_run.calls[0].index("-z") + 1]
+        assert "Now reply to the latest user message" not in prompt
+
+    def test_the_focus_topic_reaches_the_prompt(self, client, fake_run):
+        fake_run(self.SUMMARY)
+        client.post("/api/compact",
+                    json={"history": self.HISTORY, "focus": "the TLS work"})
+        prompt = fake_run.calls[0][fake_run.calls[0].index("-z") + 1]
+        assert "the TLS work" in prompt
+
+    def test_the_model_override_is_passed_through(self, client, fake_run):
+        fake_run(self.SUMMARY)
+        client.post("/api/compact", json={"history": self.HISTORY,
+                                          "model": "gemini-3-flash",
+                                          "provider": "google"})
+        args = fake_run.calls[0]
+        assert "gemini-3-flash" in args and "google" in args
+
+    def test_a_tool_trace_is_stripped_from_the_summary(self, client, fake_run):
+        """--yolo stays on so a stray tool call can't hang the request on a
+        confirmation. The trace it prints must not become part of the notes."""
+        fake_run("● read_file {\"path\": \"/opt/app\"}\n↳ ok\n" + self.SUMMARY)
+        body = client.post("/api/compact", json={"history": self.HISTORY}).json()
+        assert body["summary"] == self.SUMMARY
+
+    def test_output_with_nothing_but_a_trace_is_an_error(self, client, fake_run):
+        """A summary of "" would wipe the conversation it replaced."""
+        fake_run("● read_file {}\n↳ ok")
+        response = client.post("/api/compact", json={"history": self.HISTORY})
+        assert response.status_code == 502
+        assert "summary" not in response.json()
+
+    def test_too_little_history_is_refused(self, client):
+        response = client.post("/api/compact",
+                               json={"history": [{"role": "user", "text": "hi"}]})
+        assert response.status_code == 400
+
+    def test_blank_turns_do_not_count_as_history(self, client):
+        response = client.post("/api/compact", json={"history": [
+            {"role": "user", "text": "hi"},
+            {"role": "assistant", "text": "   "},
+            {"role": "assistant", "text": ""}]})
+        assert response.status_code == 400
+
+    def test_a_bad_session_key_is_refused(self, client):
+        """The key is interpolated into the pkill pattern used on timeout."""
+        response = client.post("/api/compact",
+                               json={"history": self.HISTORY, "session": "../../x"})
+        assert response.status_code == 400
+
+    def test_a_compaction_is_not_a_turn(self, client, fake_run, turns_dir):
+        """It transforms the client's own state; a record of it would surface
+        in /api/turns as a turn nobody sent."""
+        fake_run(self.SUMMARY)
+        client.post("/api/compact", json={"history": self.HISTORY})
+        assert server.TURNS == {}
+        assert list(turns_dir.iterdir()) == []
+
+    def test_a_cli_error_is_not_stored_as_a_summary(self, client, fake_run):
+        """Observed against a live agent: the CLI printed "API call failed
+        after 3 retries: Connection error." on stdout and exited 0. Returned as
+        a summary, that sentence REPLACES the conversation it was meant to
+        preserve — so the text is checked, not the exit code."""
+        fake_run("API call failed after 3 retries: Connection error.", code=0)
+        response = client.post("/api/compact", json={"history": self.HISTORY})
+        assert response.status_code == 502
+        assert "summary" not in response.json()
+        assert "Connection error" in response.json()["error"]
+
+    def test_a_traceback_is_not_stored_as_a_summary(self, client, fake_run):
+        fake_run("Traceback (most recent call last):\n" + "  File x, line 1\n" * 20)
+        assert client.post("/api/compact",
+                           json={"history": self.HISTORY}).status_code == 502
+
+    def test_a_summary_too_short_to_carry_anything_is_refused(self, client, fake_run):
+        """Catches the failure lines no vocabulary list anticipated."""
+        fake_run("ok")
+        response = client.post("/api/compact", json={"history": self.HISTORY})
+        assert response.status_code == 502
+        assert "2 characters" in response.json()["error"]
+
+    def test_the_floor_is_configurable(self, client, fake_run, monkeypatch):
+        monkeypatch.setattr(server, "COMPACT_MIN_CHARS", 1)
+        fake_run("ok")
+        assert client.post("/api/compact",
+                           json={"history": self.HISTORY}).json()["summary"] == "ok"
+
+    def test_a_summary_may_still_discuss_an_error(self, client, fake_run):
+        """The signature check must anchor at the start of the output, or a
+        conversation ABOUT a failure can never be compacted."""
+        fake_run("goal: fix the deploy\n"
+                 "fact: the agent logged 'API call failed after 3 retries'\n"
+                 "open: still need to check the LLM endpoint")
+        assert client.post("/api/compact",
+                           json={"history": self.HISTORY}).status_code == 200
+
+    def test_a_timeout_kills_the_container_process(self, client, fake_exec,
+                                                   monkeypatch):
+        """asyncio.wait_for abandons the coroutine but leaves the hermes run
+        inside the container burning the model."""
+        import asyncio as _asyncio
+
+        async def _hang(*args, **kwargs):
+            await _asyncio.sleep(5)
+            return 0, "never"
+
+        monkeypatch.setattr(server, "_run", _hang)
+        monkeypatch.setattr(server, "COMPACT_TIMEOUT", 0.01)
+        fake_exec()
+        response = client.post("/api/compact", json={"history": self.HISTORY})
+        assert response.status_code == 504
+        assert any("pkill" in a for call in fake_exec.calls for a in call)

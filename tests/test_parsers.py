@@ -42,6 +42,59 @@ class TestComposePrompt:
         assert "DIRECTIVE" not in server._compose_prompt([], "go", agent_mode=False)
 
 
+    def test_a_compact_anchor_is_labelled_not_attributed(self, monkeypatch):
+        """A /compact anchor is the conversation's own older turns folded up,
+        not something either side said. Rendered as "Assistant: <notes>" the
+        model reads its own summary as its previous reply and defends it."""
+        monkeypatch.setattr(server, "SYSTEM_PREAMBLE", "")
+        prompt = server._compose_prompt(
+            [{"role": "compact", "text": "goal: ship TLS"},
+             {"role": "user", "text": "carry on"}],
+            "next")
+        assert "[Summary of earlier conversation]\ngoal: ship TLS" in prompt
+        assert "Assistant: goal: ship TLS" not in prompt
+        assert "User: goal: ship TLS" not in prompt
+
+
+class TestCompactPrompt:
+    """The compaction prompt is a different shape from the chat prompt, and
+    the differences are the point — each one is a way a compaction can quietly
+    turn into an ordinary reply."""
+
+    HISTORY = [{"role": "user", "text": "first"},
+               {"role": "assistant", "text": "answer"}]
+
+    def test_the_history_is_rendered_the_same_way_as_in_a_chat_turn(self):
+        prompt = server._compose_compact_prompt(self.HISTORY)
+        assert "User: first" in prompt
+        assert "Assistant: answer" in prompt
+
+    def test_it_carries_the_compaction_directive(self, monkeypatch):
+        monkeypatch.setattr(server, "COMPACT_DIRECTIVE", "FOLD-IT-UP")
+        assert "FOLD-IT-UP" in server._compose_compact_prompt(self.HISTORY)
+
+    def test_it_has_no_reply_framing(self):
+        assert "Now reply" not in server._compose_compact_prompt(self.HISTORY)
+
+    def test_it_omits_the_system_preamble(self, monkeypatch):
+        """The preamble tells the model to go inspect the filesystem. A
+        summarizer has everything it needs in the prompt, and a nudge toward
+        tools is the wrong one here."""
+        monkeypatch.setattr(server, "SYSTEM_PREAMBLE", "GO-USE-YOUR-TOOLS")
+        assert "GO-USE-YOUR-TOOLS" not in server._compose_compact_prompt(self.HISTORY)
+
+    def test_a_focus_topic_asks_for_emphasis_not_exclusion(self):
+        """A focus that licensed dropping the rest would lose the constraints
+        the next turn still has to obey."""
+        prompt = server._compose_compact_prompt(self.HISTORY, "the TLS work")
+        assert "the TLS work" in prompt
+        assert "without omitting" in prompt
+
+    def test_a_blank_focus_adds_nothing(self):
+        assert (server._compose_compact_prompt(self.HISTORY)
+                == server._compose_compact_prompt(self.HISTORY, ""))
+
+
 class TestDefaultPreamble:
     """The built-in note must stay installation-agnostic.
 
