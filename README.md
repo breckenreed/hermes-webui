@@ -112,7 +112,8 @@ Set in `docker-compose.yml` (or via environment):
 | Variable | Default | Description |
 |---|---|---|
 | `HERMES_CONTAINER` | `hermes-agent` | Name of the running Hermes container to drive |
-| `LLM_CLIENT_UID` | *(from `.env`)* | Passed through to `hermes` so the agent can reach its LLM endpoint |
+| `LLM_CLIENT_UID` | *(from `.env`)* | Fallback only. Passed through to `hermes` when the agent container has no key of its own — see [LLM key handling](#llm-key-handling). Prefer setting it in the **agent** container |
+| `HERMES_PASS_LLM_KEY` | *(unset)* | `1` forces the key onto every `docker exec` command line, as older versions always did. Only needed when the agent container's baked-in key is stale |
 | `HERMES_MODEL` | *(empty)* | Optional model override (e.g. `google/gemma-4-12b`); blank uses the Hermes default |
 | `HERMES_SYSTEM_PREAMBLE` | *(built-in default)* | Short context note prepended to every prompt so small local models use their tools instead of guessing their environment. Set to an empty string to disable |
 | `HERMES_COMPACT_DIRECTIVE` | *(built-in default)* | What `/compact` asks the model to produce when folding a conversation into notes |
@@ -210,6 +211,45 @@ than `HERMES_COMPACT_MIN_CHARS`, which catches the failure lines that
 vocabulary misses. The signature match is anchored to the *start* of the
 output, so a conversation that is genuinely *about* an API failure still
 compacts normally.
+
+### LLM key handling
+
+Command lines are not private. Every `docker exec` this webui issues shows up
+in `ps` for any local user on the host, so a key passed as `-e K=V` is readable
+by anyone with a shell there:
+
+```
+$ ps aux | grep docker
+user 39741 ... docker exec -i -e LLM_CLIENT_UID=sk-lm-… hermes-agent hermes mcp test github
+```
+
+Older versions did that on **every** call — health probes, session lists, and
+each chat turn. They also did it needlessly: the agent container normally
+carries `LLM_CLIENT_UID` in its own environment already, so the flag was
+re-injecting a value the process would have inherited anyway.
+
+At startup the webui now asks the container once whether it has the key —
+`test -n "$LLM_CLIENT_UID"`, which reports presence and never the value — and
+passes the flag only if it does not. Which path you are on is printed at
+startup:
+
+```
+LLM key: taken from the agent container's own environment (never on a command line)
+```
+
+```
+WARNING: the agent container has no LLM_CLIENT_UID of its own, so it is passed
+on every `docker exec` command line — where any local user can read it with `ps`.
+```
+
+If you see the warning, put the key in the **agent** container's environment
+(that is where `hermes` reads it from anyway) and it goes away. A container
+that cannot be reached at startup keeps the old behaviour on purpose: a missing
+key breaks every turn, which is a worse failure than the leak this removes.
+
+`HERMES_PASS_LLM_KEY=1` forces the old always-pass behaviour, for the one case
+that needs it — the container's baked-in key is stale and the webui's newer one
+has to win.
 
 ### Online models
 

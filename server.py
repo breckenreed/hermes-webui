@@ -38,6 +38,20 @@ from pydantic import BaseModel
 HERMES_CONTAINER = os.environ.get("HERMES_CONTAINER", "hermes-agent")
 DOCKER_BIN = os.environ.get("DOCKER_BIN", "docker")
 LLM_CLIENT_UID = os.environ.get("LLM_CLIENT_UID", "")
+# Command lines are not private: anything passed as `docker exec -e K=V` is
+# visible to `ps` for every local user on the host. The agent container
+# normally carries LLM_CLIENT_UID in its own environment already, which makes
+# passing it per-exec both redundant and a leak, so it is passed only when the
+# container turns out NOT to have it (probed once at startup).
+#
+# HERMES_PASS_LLM_KEY=1 forces the old always-pass behaviour. The one case
+# that needs it: the container's baked-in key is stale and the webui's newer
+# one has to win.
+FORCE_PASS_LLM_KEY = os.environ.get("HERMES_PASS_LLM_KEY", "").strip() == "1"
+# Set by the startup probe. Defaults to False so that an unprobed or
+# unreachable container behaves exactly as before — a missing key breaks every
+# turn, and that is a worse failure than the leak this removes.
+AGENT_HAS_LLM_KEY = False
 DEFAULT_MODEL = os.environ.get("HERMES_MODEL", "")  # optional override
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -354,7 +368,7 @@ def _exec_prefix(extra_env: dict | None = None) -> list[str]:
     the very values we're trying to read.
     """
     cmd = _docker("exec", "-i")
-    if LLM_CLIENT_UID:
+    if LLM_CLIENT_UID and (FORCE_PASS_LLM_KEY or not AGENT_HAS_LLM_KEY):
         cmd += ["-e", f"LLM_CLIENT_UID={LLM_CLIENT_UID}"]
     for key, value in (extra_env or {}).items():
         cmd += ["-e", f"{key}={value}"]
@@ -933,6 +947,27 @@ def _restore_turns() -> int:
         TURNS.setdefault(key, rec)
         restored += 1
     return restored
+
+
+async def _probe_agent_llm_key() -> bool:
+    """Does the agent container already carry LLM_CLIENT_UID in its own env?
+
+    Deliberately builds its own `docker exec` rather than calling
+    _exec_prefix(): the whole question is whether the key works WITHOUT being
+    injected, so the probe must not inject it.
+
+    The container is asked to report presence, never the value — a probe that
+    printed the key would land it in this process's output and become the leak
+    it exists to remove.
+    """
+    try:
+        code, out = await asyncio.wait_for(
+            _run(*_docker("exec", "-i", HERMES_CONTAINER),
+                 "sh", "-c", 'test -n "$LLM_CLIENT_UID" && echo present'),
+            timeout=15)
+    except Exception:  # noqa: BLE001
+        return False
+    return code == 0 and "present" in out
 
 
 async def _kill_container_chat(session: str) -> None:
@@ -2300,11 +2335,41 @@ async def stop(body: StopBody):
     return {"ok": True, "had_local_process": proc is not None}
 
 
+def _resolve_llm_key_passing() -> None:
+    """Decide, once, whether the LLM key has to ride on the exec command line.
+
+    Runs before the server accepts requests, so no turn is ever composed under
+    an undecided answer. A container that cannot be reached leaves the answer
+    at its compatible default (keep passing the key) — a startup probe is not
+    a good enough reason to break every turn.
+    """
+    global AGENT_HAS_LLM_KEY
+    if not LLM_CLIENT_UID:
+        return
+    if FORCE_PASS_LLM_KEY:
+        print("LLM key: HERMES_PASS_LLM_KEY=1 — passing it on every exec "
+              "command line, where `ps` on the host can read it", flush=True)
+        return
+    try:
+        AGENT_HAS_LLM_KEY = asyncio.run(_probe_agent_llm_key())
+    except Exception:  # noqa: BLE001
+        AGENT_HAS_LLM_KEY = False
+    if AGENT_HAS_LLM_KEY:
+        print("LLM key: taken from the agent container's own environment "
+              "(never on a command line)", flush=True)
+    else:
+        print("WARNING: the agent container has no LLM_CLIENT_UID of its own, "
+              "so it is passed on every `docker exec` command line — where "
+              "any local user can read it with `ps`. Set the key in the agent "
+              "container's environment to stop this (see README).", flush=True)
+
+
 def _startup() -> None:
     """One-time setup for a real server start: report the access-control
     posture, prune stale records, and reload the ones worth keeping."""
     for warning in _audit_token_config():
         print(f"WARNING: {warning}", flush=True)
+    _resolve_llm_key_passing()
     pruned = _prune_turn_files()
     restored = _restore_turns()
     print(f"turn records: dir={TURNS_DIR} restored={restored} pruned={pruned}",
