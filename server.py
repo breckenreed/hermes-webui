@@ -78,6 +78,31 @@ _DEFAULT_AGENT_DIRECTIVE = (
 )
 AGENT_DIRECTIVE = os.environ.get("HERMES_AGENT_DIRECTIVE", _DEFAULT_AGENT_DIRECTIVE).strip()
 
+# Compaction directive for /api/compact. Because the webui owns the
+# conversation and injects ALL of it into every prompt (see _compose_prompt), a
+# long chat pays for its own length on every single turn — context and cost
+# grow with each exchange until the window no longer fits. /compact asks the
+# model to fold the old turns into notes dense enough to keep working from,
+# which the client then swaps in for the turns themselves. Override with
+# HERMES_COMPACT_DIRECTIVE.
+_DEFAULT_COMPACT_DIRECTIVE = (
+    "Summarize the conversation above so that it can REPLACE those messages "
+    "as the context for the rest of this chat. Preserve, in this order: what "
+    "the user is trying to achieve; decisions and constraints already settled; "
+    "concrete facts established (file paths, names, versions, commands, error "
+    "text); work already done; and what is still open. Keep identifiers "
+    "verbatim — an approximated path, name or version is worse than an omitted "
+    "one, because the next turn will act on it. Write compact notes, not "
+    "prose. Do not address the user and do not comment on the summary itself. "
+    "Use no tools: everything you need is already above."
+)
+COMPACT_DIRECTIVE = os.environ.get("HERMES_COMPACT_DIRECTIVE", _DEFAULT_COMPACT_DIRECTIVE).strip()
+
+# A compaction is one shot with no tool work, but it reads the whole
+# conversation, and a local model on a long chat is not fast. Bounded so a
+# wedged run cannot hold a request open forever.
+COMPACT_TIMEOUT = float(os.environ.get("HERMES_COMPACT_TIMEOUT", "300"))
+
 # Markers wrap the preamble in the sent prompt so we can strip it back out when
 # rendering a stored transcript — the user only ever sees their own text.
 PREAMBLE_OPEN = "<<webui-context>>"
@@ -631,6 +656,29 @@ async def rename_session(sid: str, body: RenameBody):
     return JSONResponse({"ok": code == 0, "message": out}, status_code=200 if code == 0 else 500)
 
 
+def _render_turns(history: list[dict]) -> list[str]:
+    """Render history entries as the labelled lines a prompt carries.
+
+    Shared by the chat prompt and the compaction prompt so the model never
+    sees two different transcript formats for the same conversation.
+    """
+    lines: list[str] = []
+    for m in history or []:
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        if m.get("role") == "compact":
+            # A /compact anchor stands in for the turns it replaced, so it is
+            # labelled as a summary rather than attributed to a speaker:
+            # "Assistant: <summary>" would read to the model as something it
+            # actually said, and it would answer for those words.
+            lines.append("[Summary of earlier conversation]\n" + text)
+            continue
+        who = "User" if m.get("role") == "user" else "Assistant"
+        lines.append(f"{who}: {text}")
+    return lines
+
+
 def _compose_prompt(history: list[dict], message: str, agent_mode: bool = False) -> str:
     """Build a single prompt carrying the whole conversation.
 
@@ -646,17 +694,37 @@ def _compose_prompt(history: list[dict], message: str, agent_mode: bool = False)
         parts.append(SYSTEM_PREAMBLE)
     if agent_mode and AGENT_DIRECTIVE:
         parts.append(AGENT_DIRECTIVE)
-    turns = [m for m in (history or []) if (m.get("text") or "").strip()]
+    turns = _render_turns(history)
     if turns:
         parts.append("# Conversation so far")
-        for m in turns:
-            who = "User" if m.get("role") == "user" else "Assistant"
-            parts.append(f"{who}: {m['text'].strip()}")
+        parts.extend(turns)
         parts.append(
             "# Now reply to the latest user message below, using the "
             "conversation above as context."
         )
     parts.append(f"User: {message.strip()}")
+    return "\n\n".join(parts)
+
+
+def _compose_compact_prompt(history: list[dict], focus: str = "") -> str:
+    """Build the one-shot prompt that turns a conversation into a summary.
+
+    Deliberately not _compose_prompt: there is no "now reply to the user"
+    framing, and no system preamble telling the model to go inspect the
+    filesystem — this turn must work only from what is in front of it, and an
+    instruction to reach for tools is exactly the wrong nudge here.
+    """
+    parts = ["# Conversation to summarize"]
+    parts.extend(_render_turns(history))
+    parts.append(COMPACT_DIRECTIVE)
+    if focus:
+        # The focus is the user's own words; it steers emphasis, it does not
+        # license dropping the rest — a summary that keeps only the focus
+        # would silently lose the constraints the next turn still has to obey.
+        parts.append(
+            "Keep this topic in more detail than the rest, without omitting "
+            f"the rest: {focus}"
+        )
     return "\n\n".join(parts)
 
 
@@ -2083,6 +2151,129 @@ async def chat(body: ChatBody):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class CompactBody(BaseModel):
+    history: list[dict] = []          # the turns to fold into a summary
+    focus: str = ""                   # optional topic to keep in more detail
+    model: str = ""                   # same per-turn overrides as /api/chat
+    provider: str = ""
+    session: str = ""                 # turn key, so a slow compaction is killable
+
+
+# The CLI prints its tool trace on the same stream as the reply, so a
+# compaction that decided to look something up would otherwise return its own
+# trace as part of the "summary". Mirrors isToolLine() in index.html — the
+# frontend has always split these two things apart for the transcript, and a
+# summary needs the same split before it is written back into the history.
+COMPACT_TOOL_LINE_RE = re.compile(r"^(\[|●|✓|✗|→|↳|⟳|⏺|tool|Running|Executing|\$ )", re.I)
+
+
+# The CLI reports its own failures on stdout and still exits 0. Observed
+# against a live agent: the whole reply was "API call failed after 3 retries:
+# Connection error." — returned as a perfectly ordinary success. Trusting the
+# exit code there means handing that sentence back as the summary, and the
+# client replaces a real conversation with it. So the text is what gets
+# checked, not the return code.
+COMPACT_FAILURE_RE = re.compile(
+    r"^\s*(api call failed|connection error|request failed|rate limit"
+    r"|error:|traceback \(most recent call last\)|failed to |no api key"
+    r"|authentication failed)", re.I)
+
+# Floor for "something was actually summarized". A compaction needs at least
+# two turns of history, and notes covering the goal, the decisions, the facts
+# established and what is still open do not fit in less than this. Lower it if
+# your conversations are genuinely tiny.
+COMPACT_MIN_CHARS = int(os.environ.get("HERMES_COMPACT_MIN_CHARS", "80"))
+
+
+def _summary_problem(summary: str) -> str:
+    """Why this output must not be written back as history — "" if it is fine.
+
+    Both checks exist because they catch different shapes of the same bug: the
+    signature match catches a long traceback that is plainly not a summary, and
+    the length floor catches a terse failure line that no vocabulary list
+    anticipated.
+    """
+    if not summary:
+        return "the model returned nothing"
+    if COMPACT_FAILURE_RE.match(summary):
+        return summary.splitlines()[0].strip()[:200]
+    if len(summary) < COMPACT_MIN_CHARS:
+        return f"only {len(summary)} characters came back"
+    return ""
+
+
+def _clean_summary(out: str) -> str:
+    kept = [ln for ln in (out or "").splitlines()
+            if not (COMPACT_TOOL_LINE_RE.match(ln.strip()) and len(ln.strip()) < 200)]
+    return "\n".join(kept).strip()
+
+
+@app.post("/api/compact")
+async def compact(body: CompactBody):
+    """Summarize a conversation so the client can replace its old turns with it.
+
+    This is the answer to the cost of owning the conversation in the browser:
+    every turn re-sends the whole history, so a long chat gets more expensive
+    with each exchange and eventually stops fitting the window. Compaction runs
+    one tool-less Hermes turn over the history and hands back notes the client
+    swaps in for the messages it summarized.
+
+    Deliberately NOT a turn: no record is written, no poller runs, and nothing
+    lands in /api/turns. A compaction is a transformation of the client's own
+    state, not something the user said — a record of it would show up in the
+    "what survived a restart" view as a turn nobody sent. It is also not
+    resumable for the same reason: if it dies, the client still holds the
+    original history and simply keeps it.
+    """
+    turns = _render_turns(body.history)
+    if len(turns) < 2:
+        return JSONResponse({"error": "nothing to compact"}, status_code=400)
+
+    # The key names the forked Hermes session and is interpolated into the
+    # `pkill -f` pattern used to clean up a timeout, so it is validated exactly
+    # like a chat turn key rather than trusted.
+    session = (body.session or "").strip() or f"compact_{int(time.time() * 1000):x}"
+    if not _valid_turn_key(session):
+        return JSONResponse({"error": "bad session key"}, status_code=400)
+
+    args = _exec_prefix() + [
+        "hermes", "-z", _compose_compact_prompt(body.history, body.focus.strip()),
+        "--resume", session,
+        # --yolo is kept even though the directive tells the model to use no
+        # tools: without it a model that reaches for one anyway blocks on a
+        # confirmation nobody can answer, and the request hangs to its timeout.
+        "--yolo", "--cli",
+    ]
+    model = body.model.strip() or DEFAULT_MODEL
+    if model:
+        args += ["-m", model]
+    if body.provider.strip():
+        args += ["--provider", body.provider.strip()]
+
+    try:
+        code, out = await asyncio.wait_for(_run(*args), timeout=COMPACT_TIMEOUT)
+    except asyncio.TimeoutError:
+        # wait_for only abandons the coroutine; the process itself is still
+        # running inside the container and would keep burning the model.
+        await _kill_container_chat(session)
+        return JSONResponse(
+            {"error": f"compaction timed out after {int(COMPACT_TIMEOUT)}s"},
+            status_code=504)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": f"failed to launch hermes: {e}"},
+                            status_code=500)
+
+    summary = _clean_summary(out)
+    problem = _summary_problem(summary)
+    if problem:
+        return JSONResponse(
+            {"error": f"no usable summary: {problem}",
+             "detail": (out or "").strip()[-400:], "code": code},
+            status_code=502)
+    return {"summary": summary, "chars": len(summary),
+            "turns": len(turns), "model": model, "code": code}
 
 
 class StopBody(BaseModel):

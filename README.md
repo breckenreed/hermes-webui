@@ -17,11 +17,12 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - 🧮 **Inline LaTeX** — models write maths in prose constantly (`$\rightarrow$`, `$x^2$`, `$\leq$`) and it used to print literally, dollar signs and all. Common commands now render as Unicode (→, x², ≤, α) with no CDN or maths library, keeping the one-file/offline guarantee. Money (`$5 to $10`) and anything inside backticks or code fences are deliberately left alone, and an unrecognised command is passed through untouched rather than half-converted.
 - 📋 **Markdown tables** — models emit comparison/summary tables constantly; these now render as real tables (with `:---`/`---:` alignment, wrapped cells, and their own horizontal scroll) instead of a column of literal `| a | b |` lines that only read correctly if you pasted them back into a `.md` file.
 - 📌 **Scroll anchoring** — the transcript follows new output only while you are already at the bottom. Scroll up mid-turn to re-read your prompt or check what the agent just did and the view stays put; a **↓ Latest** pill appears to take you back, and returning to the bottom re-arms following on its own. Previously every streamed chunk, tool event and 4s recovery poll yanked you back down, so reading anything earlier was impossible until the turn finished.
-- 📊 **Context meter** — the top bar shows estimated token usage for the current conversation against the model's configured context window (hover for the breakdown: fixed prompt budget vs. history).
+- 📊 **Context meter** — the top bar shows estimated token usage against the model's configured context window, with the two halves kept apart: `~23.1k+296 / 90k (26%)` is the fixed prompt budget (system prompt, skills index, tool schemas — set by how the agent is configured) plus the conversation itself (re-sent in full every turn, and the only half you can act on). Summed into one number the second is invisible — a 23k budget swallows a few hundred tokens of chat, so compacting a conversation in half moved the display by nothing and looked like it had failed. Warning colours still track the total, since that is what actually overflows; hover for the full breakdown.
 - 🕒 **Timestamps & live status** — every tool call/result is stamped `HH:MM:SS` and each reply shows a completion time. On reconnect the chat shows the *actual* current condition (`Running tool: write_file`, `Generating response…`) with elapsed time, instead of a flat "still generating".
 - 🔌 **Disconnect-proof turns** — every turn is recorded server-side (memory + disk). A mobile client that locks, backgrounds, or loses wifi mid-turn reattaches on return: it sees the sub-steps completed so far while the turn is still running, gets the full reply when it finishes, and sees *"Prompt processing failed"* only after the server has checked its records, the live process, and the Hermes session store.
 - 🧵➕🧵 **True multi-conversation concurrency** — every turn is tracked per conversation, not globally. Switch chats freely while a turn is running elsewhere; each one keeps streaming, recovering, and saving to *its own* history. (Earlier versions used a single global "busy"/message-list, so a turn that outlived a conversation switch — new tab, reload + immediate switch — could apply its reply to whatever chat was on screen when it finished. Fixed.)
-- ⌨️ **Slash commands** — `/queue <text>` lines up a follow-up that sends automatically the moment the current turn finishes; `/steer <text>` stops the current step and immediately redirects the agent with a new instruction (plus whatever partial output it had produced) instead of waiting for it to finish; `/stop` stops the running turn. Autocompletes as you type `/`.
+- ⌨️ **Slash commands** — `/queue <text>` lines up a follow-up that sends automatically the moment the current turn finishes; `/steer <text>` stops the current step and immediately redirects the agent with a new instruction (plus whatever partial output it had produced) instead of waiting for it to finish; `/stop` stops the running turn; `/compact [topic]` folds earlier turns into a summary. Autocompletes as you type `/`.
+- 🗜 **Compaction** — because the webui owns the conversation and injects **all** of it into every prompt, a long chat pays for its own length on every turn: the context meter climbs even when the topic hasn't moved, and eventually the window stops fitting. `/compact` runs one tool-less turn that folds the older messages into dense notes and **replaces** them with those notes, so the thread continues from a fraction of the context instead of being abandoned for a new chat. The last exchange is kept verbatim (a summary flattens exactly the detail the next reply leans on hardest), the result is a visible, expandable anchor rather than a silent edit, and a failed compaction changes nothing — you keep the original history. See [Compaction](#compaction).
 - 🌐 **Online model picker** — a composer button lists every entry in Hermes' `fallback_providers` config (Gemini, or anything else you've configured) as an on-demand choice, not just an automatic failover. Pick one and the next message routes through it (`-m <model> --provider <provider>` for that turn only — no config change, no restart); pick "🖥 Local" to go back. See [Online models](#online-models) below.
 - ⚡ **"Use best available" + automatic rate-limit rerouting** — one click starts a turn at the top of your `fallback_providers` hierarchy and lets Hermes' own retry loop cascade through the rest of the chain in-process if a model hits a rate limit, so a single turn can survive several models' quotas being exhausted without you doing anything. Because that switch is otherwise silent (Hermes only prints it to a live console, never to the transcript), the webui detects it by diffing the session's final model against what was requested and shows a persistent, timestamped notice — `⚠️ gemini-3.6-flash was rate-limited — continued on gemini-3-flash-preview` — plus a toast at the moment it happens.
 - 🩺 **Live health that means something** — the dot answers "can the agent take a turn?", not merely "is its container running?". Three states: **green** (container up and the CLI answered), **amber** (container up, agent silent — turns will fail) and **red** (container down). The old check only read `{{.State.Running}}`, so when the agent exited and its restart policy revived it, the light stayed green through the whole outage while every in-flight turn died. The CLI probe is cached so the 15s poll stays cheap, and a **restart is detected within one poll** via the container’s start time: any turn that began before it cannot have survived, so it is cut loose into the normal recovery path immediately instead of waiting out the 45s stream watchdog, and you get told it happened.
@@ -74,6 +75,7 @@ Type these into the composer:
 | `/queue <text>` | Sends `<text>` as a normal follow-up message the moment the current turn finishes. Useful for typing ahead instead of waiting. Multiple `/queue` calls append to one another. |
 | `/steer <text>` | Stops the current step and immediately re-prompts the model with `<text>`, including whatever partial output/tool trace it had produced so far. `hermes -z` can't be interrupted mid-generation (it isn't reading stdin while it runs), so this is "stop + redirect with context," not true mid-stream steering — that's the honest limit of the one-shot-process architecture. |
 | `/stop` | Stops the turn running in the current conversation. Same as clicking the Send button while it shows ■. |
+| `/compact [topic]` | Summarizes the earlier messages of this conversation and replaces them with the summary, freeing context. With a topic, that subject is kept in more detail than the rest. `/compress` is an alias. See [Compaction](#compaction). |
 
 Autocomplete appears as soon as you type `/`; arrow keys to select, Tab/Enter
 to fill in the command name. Both commands work even while a turn from the
@@ -112,6 +114,9 @@ Set in `docker-compose.yml` (or via environment):
 | `LLM_CLIENT_UID` | *(from `.env`)* | Passed through to `hermes` so the agent can reach its LLM endpoint |
 | `HERMES_MODEL` | *(empty)* | Optional model override (e.g. `google/gemma-4-12b`); blank uses the Hermes default |
 | `HERMES_SYSTEM_PREAMBLE` | *(built-in default)* | Short context note prepended to every prompt so small local models use their tools instead of guessing their environment. Set to an empty string to disable |
+| `HERMES_COMPACT_DIRECTIVE` | *(built-in default)* | What `/compact` asks the model to produce when folding a conversation into notes |
+| `HERMES_COMPACT_TIMEOUT` | `300` | Seconds a compaction may run before it is abandoned and the container-side process killed |
+| `HERMES_COMPACT_MIN_CHARS` | `80` | Below this, a compaction result is rejected rather than written back as history |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
 | `WEBUI_AUTH_MAX_FAILURES` | `10` | Bad tokens from one IP before it is locked out |
@@ -146,6 +151,64 @@ docker exec hermes-agent ls /host
 ```
 
 Port mapping (host `8090` → container `8000`) is set in `docker-compose.yml`.
+
+### Compaction
+
+Owning the conversation in the browser is what makes context correct on every
+turn — but it has a running cost. The whole history is re-sent with each
+message, so turn 40 pays for turns 1–39 all over again. Nothing is wrong when
+this happens; it is simply what "inject the history every time" means, and the
+context meter is where you watch it happen.
+
+`/compact` is the release valve. It runs **one** Hermes turn whose prompt is the
+conversation plus a summarisation directive, and whose reply replaces the
+messages it summarised:
+
+```
+/compact                 # fold everything except the last exchange
+/compact the TLS work    # …keeping that topic in more detail than the rest
+```
+
+What it deliberately does **not** do:
+
+- **It doesn't touch the last exchange.** A summary flattens exactly the detail
+  the next reply leans on hardest. The final user message and its answer stay
+  verbatim, and only what precedes them is folded.
+- **It isn't silent.** The result lands in the transcript as an expandable
+  `🗜 Compacted N messages` anchor. Replacing a conversation with a paraphrase
+  is not something to do behind the user's back — you can open it and check
+  what survived before trusting the thread to it.
+- **It isn't a turn.** No turn record is written and nothing appears in
+  `/api/turns`: a compaction transforms your own client state, it is not
+  something anyone said. It is not resumable for the same reason — if it dies,
+  you still hold the original history.
+- **It can't run alongside a turn**, in either direction: a reply in flight is
+  about to append to the very history being folded, and sending is refused
+  while a compaction runs. If it fails, times out, or comes back empty, the
+  stored conversation is untouched — you lose a model turn, never a chat.
+
+The model is asked for notes rather than prose, and told to keep identifiers
+(paths, names, versions, error text) **verbatim** — an approximated path is
+worse than an omitted one, because the next turn will act on it. Override the
+whole instruction with `HERMES_COMPACT_DIRECTIVE`.
+
+**The exit code is not trusted.** The Hermes CLI reports its own failures on
+stdout and still exits `0`. During development this came back as an entire
+"summary":
+
+```
+API call failed after 3 retries: Connection error.
+```
+
+Written back, that sentence *replaces* the conversation it was supposed to
+preserve — the worst possible outcome for a feature whose whole job is not
+losing context. So the output text is what gets checked: anything that opens
+with the CLI's failure vocabulary (`API call failed`, `Connection error`,
+`Traceback…`, `Rate limit`, …) is refused with a 502, as is anything shorter
+than `HERMES_COMPACT_MIN_CHARS`, which catches the failure lines that
+vocabulary misses. The signature match is anchored to the *start* of the
+output, so a conversation that is genuinely *about* an API failure still
+compacts normally.
 
 ### Online models
 
@@ -260,6 +323,7 @@ The FastAPI backend also exposes a small JSON API you can script against:
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
 | `GET`  | `/api/turn/{session}` | Reattach point for a lost turn: `{status: running\|done\|failed, events, text}`. While running, returns completed sub-steps (tool calls/results, interim messages) live; reports `failed` only after checking the record, the live process, and the Hermes session store |
 | `POST` | `/api/turn/{session}/ack` | Confirm receipt of a turn's outcome; the server then drops its record. Until acked, reconnects can replay it |
+| `POST` | `/api/compact` | Fold a conversation into a summary the client can swap in for the turns it replaces: `{"history":[{"role","text"}],"focus","model","provider","session"}` → `{summary, chars, turns, model}`. One tool-less Hermes turn; writes **no** turn record. `focus` biases emphasis without licensing omission. 400 if there is too little history, 502 if the model returns nothing usable, 504 on timeout (the container-side process is killed) |
 | `GET`  | `/api/context` | Context-window report: `{model, context_length, base_tokens, breakdown}` — the fixed prompt budget Hermes spends before the conversation starts (from `hermes prompt-size`). Token counts estimated at ~4 chars/token. Cached 5 min |
 | `GET`  | `/api/models` | Selectable models for the picker: `{primary:{model,provider}, options:[{model,provider,context_length,max_tokens}, ...]}` — `primary` is Hermes' configured default, `options` is the parsed `fallback_providers` chain in order. Cached 5 min |
 | `GET`  | `/api/mcp` | MCP servers, health and discovered tools: `{servers:[{name,transport,target,state,connected,connect_ms,detail,tools,selected_tools,selected_prefixed,env_refs,missing_env}], summary}`. `?refresh=1` forces a re-probe. Cached 60s |

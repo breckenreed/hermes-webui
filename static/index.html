@@ -197,6 +197,19 @@
   .tool.switch{border-left-color:var(--amber);color:var(--amber);font-weight:600}
   .tool .ts{color:var(--dim)}
   .msgtime{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:6px}
+  /* /compact anchor: deliberately unlike a message bubble — it is not something
+     anyone said, it is the conversation's own older turns folded up. Collapsed
+     by default so it reads as a marker, expandable because the user has every
+     right to check what was kept before trusting the thread to it. */
+  .compactmsg{margin:12px 0;border:1px dashed var(--border);border-left:2px solid var(--accent2);
+              border-radius:6px;background:var(--panel2)}
+  .compactmsg .chead{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;
+                     user-select:none;font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .compactmsg .chead .ctoggle{margin-left:auto;color:var(--accent2)}
+  .compactmsg .cbody{display:none;padding:2px 12px 10px;font-size:13.5px;color:var(--text)}
+  .compactmsg.open .cbody{display:block}
+  .compactbusy{margin:12px 0;padding:8px 10px;border:1px dashed var(--border);border-radius:6px;
+               background:var(--panel2);font-family:var(--mono);font-size:11.5px;color:var(--muted)}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
   @keyframes pulse{0%,100%{opacity:.45}50%{opacity:1}}
   #agentbtn{background:var(--panel2);color:var(--muted);border:1px solid var(--border);border-radius:10px;
@@ -467,7 +480,7 @@
         <span id="queuetext"></span>
         <button id="queuecancel" title="Cancel">✕</button>
       </div>
-      <div class="hint">Runs <code>hermes -z … --resume &lt;session&gt; --yolo</code> inside the container. Type <code>/queue &lt;text&gt;</code> to line up a follow-up, or <code>/steer &lt;text&gt;</code> to redirect the current step.</div>
+      <div class="hint">Runs <code>hermes -z … --resume &lt;session&gt; --yolo</code> inside the container. Type <code>/queue &lt;text&gt;</code> to line up a follow-up, <code>/steer &lt;text&gt;</code> to redirect the current step, or <code>/compact</code> to fold earlier turns into a summary.</div>
     </div>
   </section>
 
@@ -581,10 +594,24 @@ function updateCtxMeter(){
                           : `${selectedModel.model} (online, via ${selectedModel.provider})`)
     : (ctxInfo.model||"?");
   const pct = max ? Math.round(used/max*100) : 0;
-  el.textContent = max ? `~${fmtK(used)} / ${fmtK(max)} (${pct}%)` : `~${fmtK(used)}`;
+  // The two halves move for entirely different reasons, so they are shown
+  // apart: the fixed budget is what Hermes spends before the chat even starts
+  // (system prompt, skills index, tool schemas) and only changes when the agent
+  // is reconfigured, while the chat half is the part you can act on — it grows
+  // every turn and drops when you /compact. Summed into one number the second
+  // one is invisible: a ~23k budget swallows a few hundred tokens of
+  // conversation, so compacting a chat in half moved the display by nothing and
+  // looked like it had failed.
+  const base = ctxInfo.base_tokens||0;
+  const shown = base ? `~${fmtK(base)}+${fmtK(conv)}` : `~${fmtK(used)}`;
+  el.textContent = max ? `${shown} / ${fmtK(max)} (${pct}%)` : shown;
   el.classList.toggle("warn", pct>=70 && pct<90);
   el.classList.toggle("danger", pct>=90);
-  el.title = `model: ${modelLabel}\nfixed prompt budget (system+skills+tools): ~${fmtK(ctxInfo.base_tokens||0)} tokens\nconversation history: ~${fmtK(conv)} tokens\ntoken counts are estimates (~4 chars/token)`;
+  el.title = `model: ${modelLabel}\n`
+           + `fixed prompt budget (system+skills+tools): ~${fmtK(base)} tokens — set by the agent, not by this chat\n`
+           + `conversation history: ~${fmtK(conv)} tokens — re-sent in full every turn; /compact shrinks it\n`
+           + `total: ~${fmtK(used)} tokens${max?` of ${fmtK(max)} (${pct}%)`:""}\n`
+           + `token counts are estimates (~4 chars/token)`;
 }
 async function fetchContext(){
   try{ const r=await fetch("/api/context"); ctxInfo=await r.json(); updateCtxMeter(); }
@@ -838,13 +865,21 @@ function showEmpty(){
     Local Hermes is ready.<br>Send a command to begin.</div>`;
 }
 function renderConversation(){
-  if(!messages.length){ showEmpty(); return; }
+  if(!messages.length && !compacting.has(activeId)){ showEmpty(); return; }
   // A full rebuild resets scrollTop to 0. The recovery poller re-renders every
   // 4s while a turn runs, so without preserving the offset a reader who had
   // scrolled up got thrown to the TOP of the transcript on every tick.
   const prevTop = chatEl.scrollTop;
   messagesEl.innerHTML="";
-  messages.forEach(m=> renderMessage(m.role, m.text, m.tools, m.ts));
+  messages.forEach(m=> renderMessage(m.role, m.text, m.tools, m.ts, m));
+  // Lives in the render pass, not as a one-off DOM node: a compaction takes a
+  // whole model turn, and switching away and back (or any re-render) would
+  // otherwise wipe the only sign that anything is happening.
+  if(compacting.has(activeId)){
+    const busy=document.createElement("div"); busy.className="compactbusy";
+    busy.textContent="🗜 Compacting earlier messages…";
+    messagesEl.append(busy);
+  }
   if(stickToBottom){ scroll(); }
   else {
     // Everything that changed sits at the END of the transcript (a growing
@@ -1083,13 +1118,32 @@ function switchLine(from, to, ts){
 }
 
 /* render a full transcript message (with optional tool lines + a time footer) */
-function renderMessage(role, text, tools, ts){
+function renderMessage(role, text, tools, ts, m){
+  if(role==="compact"){ renderCompactAnchor(text, ts, m); return; }
   const body=addMsg(role==="user"?"user":"assistant");
   let html="";
   (tools||[]).forEach(t=> html+=toolHtml(t));
   if(text) html += renderMarkdown(text);
   if(ts && role!=="user") html += `<div class="msgtime">${fmtClock(ts)}</div>`;
   body.innerHTML=html;
+}
+
+function renderCompactAnchor(text, ts, m){
+  clearEmpty();
+  const n=(m&&m.n)||0;
+  const wrap=document.createElement("div"); wrap.className="compactmsg";
+  const head=document.createElement("div"); head.className="chead";
+  head.innerHTML=`<span>\u{1F5DC} Compacted ${n} message${n===1?"":"s"}</span>`
+                +(ts?`<span>\u00b7 ${fmtClock(ts)}</span>`:"")
+                +`<span class="ctoggle">show</span>`;
+  const body=document.createElement("div"); body.className="cbody";
+  body.innerHTML=renderMarkdown(text||"");
+  head.onclick=()=>{
+    const open=wrap.classList.toggle("open");
+    head.querySelector(".ctoggle").textContent = open ? "hide" : "show";
+  };
+  wrap.append(head, body); messagesEl.append(wrap);
+  scroll();
 }
 
 function openConvo(id){
@@ -1262,10 +1316,77 @@ function steerMessage(text, forId){
   rec.abort.abort();
 }
 
+/* ---------- /compact ----------
+   The webui owns the conversation and injects ALL of it into every prompt, so
+   a long chat pays for its own length on every turn: the context meter climbs
+   with each exchange even when the topic hasn't moved, and eventually the
+   window stops fitting. Compaction folds the older turns into notes and
+   REPLACES them with those notes, so the thread continues from a fraction of
+   the context instead of being abandoned for a new chat.
+
+   The last exchange is kept verbatim. A summary flattens exactly the detail
+   the next reply leans on hardest, and losing it is the difference between
+   "continue" and "start over". */
+const COMPACT_KEEP_TAIL = 2;
+const compacting = new Set();          // convoIds with a compaction in flight
+
+async function compactConversation(focus, forId){
+  const id = forId || activeId;
+  if(!id){ toast("Nothing to compact yet"); return; }
+  // Mutual exclusion with sending, in both directions: a turn in flight is
+  // about to append to the very history being summarized, and send() refuses
+  // while a compaction runs. That invariant is what lets the tail below be
+  // sliced by index at all.
+  if(isBusy(id)){ toast("A turn is running here — /stop it or wait, then /compact"); return; }
+  if(compacting.has(id)){ toast("Already compacting this conversation"); return; }
+
+  const msgs = loadMsgs(id);
+  const cut = Math.max(0, msgs.length - COMPACT_KEEP_TAIL);
+  const head = msgs.slice(0, cut);
+  if(head.filter(m=>(m.text||"").trim()).length < 2){
+    toast("Not enough history to compact yet"); return;
+  }
+
+  compacting.add(id);
+  if(id===activeId) renderConversation();
+  try{
+    const r = await fetch("/api/compact",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        history: head.map(m=>({role:m.role, text:m.text})),
+        focus: focus||"",
+        // Same per-turn routing as a normal message: compacting a long chat on
+        // a slow local model is exactly when you'd want the online one.
+        model: selectedModel?selectedModel.model:"", provider: selectedModel?selectedModel.provider:"",
+        session: id+"__compact_"+Date.now().toString(36),
+      })});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || !j.summary) throw new Error(j.error || `compaction failed (${r.status})`);
+
+    // Re-read rather than reusing `msgs`: nothing may append while a compaction
+    // runs, but slicing a stale array by index is the kind of assumption that
+    // silently eats messages the day that stops being true.
+    const cur = loadMsgs(id);
+    saveMsgs(id, [{role:"compact", text:j.summary, n:head.length, ts:Date.now()},
+                  ...cur.slice(cut)]);
+    if(id===activeId) updateCtxMeter();
+    toast(`Compacted ${head.length} message${head.length===1?"":"s"}`);
+  }catch(e){
+    // The stored history was never touched — a failed compaction costs a model
+    // turn, never a conversation.
+    toast(String((e&&e.message)||e));
+  }finally{
+    compacting.delete(id);
+    if(id===activeId) renderConversation();
+  }
+}
+
 const SLASH_COMMANDS = {
   queue: { desc:"Send this after the current turn finishes", run:(t)=>queueMessage(t) },
   steer: { desc:"Stop the current step and redirect with new instructions", run:(t)=>steerMessage(t) },
   stop:  { desc:"Stop the running turn", run:()=>stopGeneration(), noArg:true },
+  // Optional argument: /compact <topic> keeps that topic in more detail.
+  compact:  { desc:"Fold earlier turns into a summary to free up context", run:(t)=>compactConversation(t), noArg:true },
+  compress: { desc:"Alias for /compact", run:(t)=>compactConversation(t), noArg:true },
 };
 function trySlashCommand(raw){
   const m=raw.match(/^\/(\w+)\b\s*([\s\S]*)$/);
@@ -1300,6 +1421,13 @@ async function send(arg){
   if(!forConvo){ forConvo=newConvoId(); try{ activeId=forConvo; localStorage.setItem(ACTIVE_LS, forConvo); }catch(e){} messages=[]; }
   if(isBusy(forConvo) && !isQueued){
     if(forConvo===activeId) toast("Already running here — try /queue or /steer");
+    return;
+  }
+  // A compaction is mid-flight rewriting this conversation's history; a turn
+  // started now would be composed from turns that are about to be replaced,
+  // and its reply would land after the swap.
+  if(compacting.has(forConvo)){
+    if(forConvo===activeId) toast("Compacting this conversation — one moment");
     return;
   }
   if(!isAuto) agentRounds=0;   // any real/queued/steered message starts a fresh agent-mode budget
