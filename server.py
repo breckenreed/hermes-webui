@@ -2949,6 +2949,167 @@ async def upload(body: UploadBody, request: Request):
     return {"name": name, "bytes": len(raw), "path": f"{agent_dir}/{name}"}
 
 
+# ── Scheduled jobs ───────────────────────────────────────────────────────
+# Hermes owns the schedule; this is a control panel over `hermes cron`, reached
+# the same way as everything else here. The webui schedules nothing itself,
+# which is the point: it stays a layer you can stop, rebuild or leave off
+# without anything silently failing to run.
+#
+# Jobs only fire while the messaging gateway is up, and that is the single most
+# important thing to surface — a UI that lets somebody create three jobs which
+# then never run is worse than no UI, because they find out when the thing they
+# scheduled did not happen.
+
+# An id becomes a CLI argument, so it is validated rather than trusted.
+CRON_ID_RE = re.compile(r"[0-9a-fA-F]{6,32}")
+
+# `  3e5bbe3b111a [active]` followed by an indented block of `Key: value`.
+_CRON_HEAD_RE = re.compile(r"^\s{2}([0-9a-f]{6,32})\s*\[([^\]]+)\]\s*$")
+_CRON_FIELD_RE = re.compile(r"^\s{4,}([A-Za-z][A-Za-z ]*?):\s*(.+?)\s*$")
+_CRON_FIELD_KEYS = {"name": "name", "schedule": "schedule", "repeat": "repeat",
+                    "next run": "next_run", "deliver": "deliver",
+                    "prompt": "prompt", "skills": "skills"}
+
+
+def _parse_cron_list(out: str) -> tuple[list[dict], bool]:
+    """Jobs from `hermes cron list --all`, and whether the output was readable.
+
+    The second value matters: "the CLI said something we could not parse" and
+    "there are no jobs" look identical in an empty list, and only one of them
+    means the panel is telling the truth.
+    """
+    text = ANSI_RE.sub("", out or "")
+    if "No scheduled jobs" in text:
+        return [], True
+    jobs: list[dict] = []
+    current: dict | None = None
+    for line in text.splitlines():
+        head = _CRON_HEAD_RE.match(line)
+        if head:
+            current = {"id": head.group(1), "state": head.group(2).strip().lower()}
+            jobs.append(current)
+            continue
+        if current is None:
+            continue
+        field = _CRON_FIELD_RE.match(line)
+        if field:
+            key = _CRON_FIELD_KEYS.get(field.group(1).strip().lower())
+            if key:
+                current[key] = field.group(2)
+    # A block header is the one thing every listing has. Finding none in output
+    # that also never said "no jobs" means the format moved under us.
+    return jobs, bool(jobs)
+
+
+def _scheduler_running(out: str) -> bool:
+    """Read `hermes cron status`, not the job list.
+
+    The list only prints its gateway warning when there ARE jobs, so inferring
+    from it reports "running" on an empty list — which is precisely the moment
+    somebody is about to create their first job and most needs to be told it
+    will not fire.
+    """
+    text = ANSI_RE.sub("", out or "").lower()
+    return "not running" not in text and "✗" not in (out or "")
+
+
+@app.get("/api/cron")
+async def cron_list():
+    """Scheduled jobs, plus whether anything will actually run them."""
+    try:
+        # --all, or a paused job disappears and pausing looks like deleting.
+        _, listing = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "cron", "list", "--all"), timeout=30)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200], "jobs": [], "readable": False},
+                            status_code=502)
+    jobs, readable = _parse_cron_list(listing)
+    try:
+        _, status_out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "cron", "status"), timeout=30)
+        running = _scheduler_running(status_out)
+    except Exception:  # noqa: BLE001
+        # Unknown, and the honest default is the one that warns: a silently
+        # absent banner is the failure this feature exists to prevent.
+        running = False
+    return {
+        "jobs": jobs,
+        # False means "could not read", which the panel must not render as
+        # "no jobs" — see _parse_cron_list.
+        "readable": readable,
+        "scheduler_running": running,
+        "note": "" if running else
+                "The gateway is not running, so scheduled jobs will not fire. "
+                "Start it with `hermes gateway install` inside the agent container.",
+    }
+
+
+class CronBody(BaseModel):
+    schedule: str
+    prompt: str = ""
+    name: str = ""
+
+
+@app.post("/api/cron")
+async def cron_create(body: CronBody):
+    schedule = body.schedule.strip()
+    if not schedule:
+        return JSONResponse({"error": "a schedule is required"}, status_code=400)
+    args = ["hermes", "cron", "create", schedule]
+    if body.prompt.strip():
+        args.append(body.prompt.strip())
+    if body.name.strip():
+        args += ["--name", body.name.strip()]
+    try:
+        code, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), *args), timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+    if code != 0:
+        return JSONResponse({"error": (out or "")[-300:]}, status_code=400)
+    return {"ok": True, "message": (out or "").strip()[:400]}
+
+
+@app.post("/api/cron/{job_id}/{action}")
+async def cron_action(job_id: str, action: str):
+    if action not in ("pause", "resume", "run"):
+        return JSONResponse({"error": "unknown action"}, status_code=400)
+    if not CRON_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "bad job id"}, status_code=400)
+    try:
+        code, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "cron", action, job_id), timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+    return ({"ok": True, "message": (out or "").strip()[:400]} if code == 0
+            else JSONResponse({"error": (out or "")[-300:]}, status_code=400))
+
+
+@app.delete("/api/cron/{job_id}")
+async def cron_remove(job_id: str):
+    if not CRON_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "bad job id"}, status_code=400)
+    try:
+        code, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "cron", "remove", job_id), timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+    return ({"ok": True, "message": (out or "").strip()[:400]} if code == 0
+            else JSONResponse({"error": (out or "")[-300:]}, status_code=400))
+
+
+@app.get("/api/cron/{job_id}/runs")
+async def cron_runs(job_id: str):
+    if not CRON_ID_RE.fullmatch(job_id):
+        return JSONResponse({"error": "bad job id"}, status_code=400)
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "cron", "runs", job_id), timeout=30)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:200], "text": ""}, status_code=502)
+    return {"text": _redact(ANSI_RE.sub("", out or "")).strip()[:4000]}
+
+
 class StopBody(BaseModel):
     session: str
 
