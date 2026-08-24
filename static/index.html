@@ -1791,8 +1791,16 @@ function startEdit(body, m, i, id){
    the agent intended to do next. */
 function tripCard(trip, i){
   const el=document.createElement("div"); el.className="tripcard";
-  el.innerHTML=`<div class="th">\u26D4 Tripwire: ${esc(trip.rule)}</div>`
-             + `<div class="tn">The turn was stopped after this ran. It was not prevented.</div>`
+  // Where the verdict came from matters to the reader: the agent's own
+  // detector carries far more weight than a pattern kept in this repo. And
+  // hardline-deny means the agent refuses the command itself, which is a
+  // different situation from "it ran and we noticed".
+  const origin = trip.source === "agent" ? "the agent's own rule" : "a webui pattern";
+  const line = trip.verdict === "hardline-deny"
+    ? "The agent refuses this command outright — it is blocked even under --yolo. The turn was stopped."
+    : "The turn was stopped after this ran. It was not prevented.";
+  el.innerHTML=`<div class="th">\u26D4 Tripwire: ${esc(trip.rule)} <span style="opacity:.65">· ${esc(origin)}</span></div>`
+             + `<div class="tn">${esc(line)}</div>`
              + `<div class="tm">${esc(trip.tool)} \u2192 ${esc(trip.match)}</div>`
              + `<button class="mact" data-a="anyway" title="Re-run this turn with only this rule switched off">\u21bb Continue anyway</button>`;
   el.querySelector('[data-a="anyway"]').onclick=(e)=>{
@@ -2331,7 +2339,8 @@ async function send(arg){
           // The server has already killed the turn by the time this arrives.
           // It is a report, not a prompt: the command ran.
           const d=ev.data||{};
-          rec.tripped={rule:d.rule||"?", match:d.match||"", tool:d.tool||"?"};
+          rec.tripped={rule:d.rule||"?", match:d.match||"", tool:d.tool||"?",
+                       verdict:d.verdict||"", source:d.source||""};
           toolLines.push(`⛔ tripwire ${d.rule} — turn stopped`);
           status="Stopped by a tripwire";
           repaint();

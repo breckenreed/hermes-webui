@@ -256,6 +256,111 @@ def _safe_filename(name: str) -> str:
     return cleaned
 
 
+# ── The agent's own verdict ──────────────────────────────────────────────
+# `hermes approvals test` runs Hermes' own dangerous-command detector without
+# executing anything: exit 2 = ask-approval, exit 0 = allow, plus the rule that
+# matched. It evaluates normalised variants of the command, which is the class
+# of evasion a flat pattern misses — quoting, spacing, and the shapes a shell
+# can wrap the same command in.
+#
+# Asking it beats guessing: the rules stay in step with the agent across
+# upgrades instead of drifting away from a list maintained here. The built-in
+# patterns stay as the floor for when the subcommand is missing or the
+# container cannot be reached.
+#
+# This does NOT change the timing. See the note on _DEFAULT_TRIPWIRES: a tool
+# call is only visible once it has run, so this swaps the detector, not the
+# moment.
+VERDICT_TIMEOUT = float(os.environ.get("HERMES_VERDICT_TIMEOUT", "6"))
+_VERDICT_CACHE: dict[str, tuple[bool, str] | None] = {}
+_VERDICT_CACHE_MAX = 200
+_VERDICT_LINE_RE = re.compile(r"^\s*(verdict|rule)\s*:\s*(.+?)\s*$", re.M)
+
+
+def _call_command(args: str) -> str:
+    """The shell command a tool call is about to run, if it has one.
+
+    Only calls carrying a command are worth a verdict — a file read needs no
+    opinion, and asking for one would spend a `docker exec` per event.
+    """
+    text = (args or "").strip()
+    if not text.startswith("{"):
+        return ""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return ""
+    value = data.get("command") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+async def _agent_verdict(command: str) -> dict | None:
+    """The agent's own opinion, or None if it could not give one.
+
+    Three verdicts exist and they are not interchangeable:
+
+      allow          — no guard matched.
+      ask-approval   — would raise an interactive prompt. Under --yolo, which
+                       this webui always passes, that prompt is bypassed and
+                       the command runs.
+      hardline-deny  — "never bypassable, blocked even under --yolo". The
+                       agent refuses this one itself, so seeing it means the
+                       agent tried something it will not be allowed to do.
+
+    None is deliberately distinct from "allowed": a timeout, a missing
+    subcommand or an answer we do not recognise must fall through to the
+    built-in patterns rather than silently clearing a command nobody checked.
+    """
+    if not command:
+        return None
+    if command in _VERDICT_CACHE:
+        return _VERDICT_CACHE[command]
+    result: dict | None = None
+    try:
+        _, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "hermes", "approvals", "test", command),
+            timeout=VERDICT_TIMEOUT)
+        fields = dict(_VERDICT_LINE_RE.findall(out or ""))
+        verdict = (fields.get("verdict") or "").lower()
+        rule = (fields.get("rule") or "flagged by the agent").strip()
+        if "hardline-deny" in verdict:
+            result = {"flagged": True, "rule": rule, "verdict": "hardline-deny"}
+        elif "ask-approval" in verdict:
+            result = {"flagged": True, "rule": rule, "verdict": "ask-approval"}
+        elif "allow" in verdict:
+            result = {"flagged": False, "rule": "", "verdict": "allow"}
+    except Exception:  # noqa: BLE001
+        result = None
+    if len(_VERDICT_CACHE) < _VERDICT_CACHE_MAX:
+        _VERDICT_CACHE[command] = result
+    return result
+
+
+async def _check_call(event: dict, allowed: set) -> dict | None:
+    """What, if anything, this tool call trips.
+
+    Asks the agent first and falls back to the built-in patterns — so a
+    verdict that never arrives leaves the old behaviour rather than a gap.
+    """
+    if event.get("kind") != "call":
+        return None
+    verdict = await _agent_verdict(event.get("command", ""))
+    if verdict is not None:
+        if verdict["flagged"]:
+            if verdict["rule"] in allowed:
+                return None      # this exact rule was allowed for the turn
+            return {"rule": verdict["rule"],
+                    "match": (event.get("command") or "")[:120],
+                    "verdict": verdict["verdict"], "source": "agent"}
+        # An explicit allow still gets the local patterns run over it: they
+        # cover calls that carry no shell command at all.
+    local = _tripwire_hit(event, allowed)
+    if local:
+        return {"rule": local[0], "match": local[1],
+                "verdict": "pattern", "source": "webui"}
+    return None
+
+
 def _tripwire_hit(event: dict, allowed: set) -> tuple[str, str] | None:
     """Which rule this tool call trips, if any — (rule name, matched text).
 
@@ -1459,9 +1564,15 @@ async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
                 args = fn.get("arguments")
                 if isinstance(args, (dict, list)):
                     args = json.dumps(args, ensure_ascii=False)
+                raw_args = str(args or "")
                 events.append({"kind": "call",
                                "name": fn.get("name") or "?",
-                               "args": _redact(str(args or ""))[:300]})
+                               "args": _redact(raw_args)[:300],
+                               # `args` above is a display string and is cut at
+                               # 300 chars; a verdict on a truncated command
+                               # would quietly clear the dangerous tail of a
+                               # long one. Carried separately for that reason.
+                               "command": _redact(_call_command(raw_args))[:500]})
             if content:
                 if last:
                     final_text = content
@@ -1571,6 +1682,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                     if hit and not rec.get("tripped"):
                         rec["tripped"] = hit[0]
                         record("tripwire", {"rule": hit[0], "match": hit[1],
+                                            "verdict": "pattern", "source": "webui",
                                             "tool": ev.get("name", "?")})
                 if not rec["text"] and final_text:
                     rec["text"] = final_text
@@ -1654,14 +1766,13 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                     rec["events"].append(ev)
                     kind = ev.get("kind")
                     await q.put((kind if kind == "todo_state" else "tool", ev))
-                    hit = _tripwire_hit(ev, allowed)
+                    hit = await _check_call(ev, allowed)
                     if hit:
                         # The command has already run — this cannot prevent it,
                         # only stop whatever the agent was going to do next.
                         # See the note on _DEFAULT_TRIPWIRES.
-                        trip = record("tripwire", {"rule": hit[0], "match": hit[1],
-                                                   "tool": ev.get("name", "?")})
-                        rec["tripped"] = hit[0]
+                        trip = record("tripwire", {**hit, "tool": ev.get("name", "?")})
+                        rec["tripped"] = hit["rule"]
                         await q.put(("tripwire", trip))
                         _persist_turn(session, rec)
                         proc_now = RUNNING.get(session)
