@@ -257,6 +257,22 @@
     word-break:break-all;background:var(--code);border:1px solid var(--border);
     border-radius:5px;padding:6px 8px}
   .tripcard .tn{font-size:12px;color:var(--muted);margin-bottom:8px}
+  #todobar{display:none;border-bottom:1px solid var(--border);background:var(--panel);
+    padding:0 16px;flex:0 0 auto}
+  #todobar.show{display:block}
+  #todobar .thead{display:flex;align-items:center;gap:8px;padding:9px 0;cursor:pointer;
+    user-select:none;font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  #todobar .thead .count{margin-left:auto;color:var(--accent2)}
+  #todobar .tbody{padding:0 0 10px;max-height:34vh;overflow-y:auto}
+  #todobar.closed .tbody{display:none}
+  #todobar .titem{display:flex;gap:8px;align-items:flex-start;padding:3px 0;font-size:13px}
+  #todobar .titem .box{flex:0 0 auto;white-space:nowrap;font-family:var(--mono);
+    font-size:11px;color:var(--dim);line-height:1.5}
+  #todobar .titem.done .box{color:var(--ok,var(--accent2))}
+  #todobar .titem.done .txt{color:var(--dim);text-decoration:line-through}
+  #todobar .titem.doing .box{color:var(--accent)}
+  #todobar .titem.doing .txt{color:var(--text)}
+  #todobar .titem .txt{min-width:0;word-break:break-word}
   .compactbusy{margin:12px 0;padding:8px 10px;border:1px dashed var(--border);border-radius:6px;
                background:var(--panel2);font-family:var(--mono);font-size:11.5px;color:var(--muted)}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
@@ -518,6 +534,7 @@
       <button id="themebtn" title="Switch theme">☾</button>
       <span class="k">container</span><span class="v" id="containername">hermes-agent</span>
     </div>
+    <div id="todobar"></div>
     <div id="chat"><div class="wrap" id="messages"></div></div>
     <div id="composer">
       <button id="jumpbtn" title="Jump to the latest output">↓ Latest</button>
@@ -940,6 +957,7 @@ function renderConversation(){
     busy.textContent="🗜 Compacting earlier messages…";
     messagesEl.append(busy);
   }
+  renderTodos();
   if(stickToBottom){ scroll(); }
   else {
     // Everything that changed sits at the END of the transcript (a growing
@@ -1082,6 +1100,85 @@ function sesRow(c){
   el.onclick=()=>{ openConvo(c.id); };
   el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, c); };
   return el;
+}
+
+/* ---------- todo panel ----------
+   Agent mode exists because weaker local models write a plan and then stop, so
+   the directive pushes them to execute the whole list in one run. But that
+   plan scrolls away with the transcript: on a long multi-step turn there is no
+   answer to "where is it now, and what is left?" — which is the question agent
+   mode exists to make answerable.
+
+   Upstream derives this from the agent's in-memory TodoStore. That is not
+   available here: this fork shells into `hermes -z --cli` and sees only
+   stdout. So the list is parsed out of the model's own text, which means the
+   parser must be strict. A checklist is unambiguous; a numbered list of
+   sentences is not, and guessing produces a panel that confidently shows the
+   wrong thing. Anything it does not recognise yields NO panel rather than a
+   bad one.
+
+   Because it reads the ACTIVE conversation's own messages, one conversation's
+   plan structurally cannot appear in another — there is no shared live state
+   to leak across a switch. */
+const TODO_LS = "hermes_todo_closed";
+const TODO_LINE_RE = /^[ \t]*(?:[-*+][ \t]+)?\[([ xX~>\-])\][ \t]+(\S.*?)[ \t]*$/;
+const TODO_MIN_ITEMS = 2;      // one checkbox in prose is not a plan
+
+function parseTodos(text){
+  if(!text) return null;
+  const items = [];
+  text.split("\n").forEach(line=>{
+    const m = line.match(TODO_LINE_RE);
+    if(!m) return;
+    const mark = m[1];
+    items.push({
+      status: (mark === "x" || mark === "X") ? "done"
+            : (mark === " ") ? "pending" : "doing",
+      text: m[2]
+    });
+  });
+  if(items.length < TODO_MIN_ITEMS) return null;
+  const summary = {total: items.length, done: 0, doing: 0, pending: 0};
+  items.forEach(i=> summary[i.status]++);
+  return {items, summary, version: 1};
+}
+
+function currentTodos(liveText){
+  // A turn in flight is the freshest truth about the plan.
+  const live = parseTodos(liveText);
+  if(live) return live;
+  // Otherwise the newest message that still carries a list — scanning back
+  // rather than reading only the last one, so the panel does not blink out
+  // during a round where the model happens not to restate the plan.
+  for(let i = messages.length - 1; i >= 0; i--){
+    if(messages[i].role === "user" || messages[i].role === "compact") continue;
+    const parsed = parseTodos(messages[i].text);
+    if(parsed) return parsed;
+  }
+  return null;
+}
+
+function renderTodos(liveText){
+  const bar = $("#todobar");
+  if(!bar) return;
+  const state = currentTodos(liveText);
+  if(!state){ bar.classList.remove("show"); bar.innerHTML=""; return; }
+
+  const closed = readJSON(TODO_LS, false) === true;
+  const {items, summary} = state;
+  bar.className = "show" + (closed ? " closed" : "");
+  const rows = items.map(i=>{
+    const box = i.status === "done" ? "[x]" : i.status === "doing" ? "[~]" : "[ ]";
+    return `<div class="titem ${i.status}"><span class="box">${box}</span>`
+         + `<span class="txt">${esc(i.text)}</span></div>`;
+  }).join("");
+  bar.innerHTML = `<div class="thead"><span>\u2611 Plan</span>`
+                + `<span class="count">${summary.done}/${summary.total} done</span></div>`
+                + `<div class="tbody">${rows}</div>`;
+  bar.querySelector(".thead").onclick = ()=>{
+    writeJSON(TODO_LS, !closed);
+    renderTodos(liveText);
+  };
 }
 
 function renderConvos(){
@@ -1978,6 +2075,7 @@ async function send(arg){
     if(inFlight.has(forConvo) && !shown) html += `<div class="status">${esc(statusLine())}</div>`;
     if(inFlight.has(forConvo)) html += `<span class="cursor"></span>`;
     b.innerHTML=html; scroll();
+    renderTodos(shown);
   }
 
   // Paint before the first byte arrives. The bubble used to be created empty
