@@ -127,6 +127,7 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_COMPACT_DIRECTIVE` | *(built-in default)* | What `/compact` asks the model to produce when folding a conversation into notes |
 | `HERMES_COMPACT_TIMEOUT` | `300` | Seconds a compaction may run before it is abandoned and the container-side process killed |
 | `HERMES_COMPACT_MIN_CHARS` | `80` | Below this, a compaction result is rejected rather than written back as history |
+| `HERMES_MODEL_PRICES` | *(empty)* | Newline-separated `model=input,output` per **million** tokens, for `/usage`. Empty means every non-local model reports unknown rather than free. See [Usage and cost](#usage-and-cost) |
 | `HERMES_TRIPWIRES` | *(built-in list)* | Newline-separated `name=regex` rules matched against tool calls. Empty string disables the feature. See [Tripwires](#tripwires) |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
@@ -502,6 +503,42 @@ from drifting as features are added. Names are semantic (`--dim`, `--line`,
 means "accent used as text". Both themes are checked against WCAG AA (4.5:1 for
 body text) — the light theme's accent is deeper than the dark theme's for
 exactly that reason.
+
+## Usage and cost
+
+`/usage` toggles token counts and an estimated cost, per reply and per
+conversation. Off by default.
+
+It is worth more here than in most chat UIs, because of how this webui works:
+the whole history is re-sent on **every** turn, so a conversation's cost grows
+with the square of its length rather than linearly. That is invisible until a
+bill arrives — and it is what `/compact` exists to cut.
+
+**Everything shown is an estimate, and is labelled as one.** The Hermes CLI
+reports no usage figures, so token counts come from the same ~4-chars-per-token
+approximation the context meter uses.
+
+**No prices are built in.** They change, they vary by region and tier, and a
+number baked into this repo would be wrong for somebody the day it was written
+— and a confidently wrong cost is worse than none, because it gets believed and
+budgeted against. So you supply the ones you actually pay:
+
+```yaml
+environment:
+  - |
+    HERMES_MODEL_PRICES=some-model=0.30,2.50
+    another-model=1.00,3.00
+```
+
+Values are per **million** tokens, `input,output`. The key matches as a
+case-insensitive substring, so a family prefix covers its variants.
+
+Anything without a configured price reports **`—`**, never `0`. The
+conversation total then reads e.g. `free+?` — the `+?` says plainly that some
+turns are unaccounted for, rather than folding the unknown in as zero.
+
+The local model is **free by construction** — it runs on hardware you already
+paid for — so a turn with no model override costs nothing and says `free`.
 
 ## Tripwires
 

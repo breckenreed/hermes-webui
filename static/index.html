@@ -218,6 +218,7 @@
   .tool.switch{border-left-color:var(--amber);color:var(--amber);font-weight:600}
   .tool .ts{color:var(--dim)}
   .msgtime{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:6px}
+  .msgusage{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:2px}
   /* Per-message actions. Always rendered rather than revealed on hover: this
      UI is used from a phone as much as a desktop, and a hover-only control
      does not exist on a touch screen. */
@@ -525,6 +526,7 @@
       <span class="k">chat</span><span class="v" id="cursession">—</span>
       <span style="flex:1"></span>
       <span class="k">ctx</span><span class="v" id="ctxmeter" title="">—</span>
+      <span class="k" id="usagek" style="display:none">usage</span><span class="v" id="usagemeter" style="display:none" title="">—</span>
       <button id="mcpbtn" title="MCP servers — click to inspect health and tools">
         <span class="dot"></span><span id="mcptext">MCP —</span>
       </button>
@@ -958,6 +960,7 @@ function renderConversation(){
     messagesEl.append(busy);
   }
   renderTodos();
+  renderUsage();
   if(stickToBottom){ scroll(); }
   else {
     // Everything that changed sits at the END of the transcript (a growing
@@ -1100,6 +1103,84 @@ function sesRow(c){
   el.onclick=()=>{ openConvo(c.id); };
   el.querySelector(".dots").onclick=(e)=>{ e.stopPropagation(); openMenu(e.currentTarget, c); };
   return el;
+}
+
+/* ---------- usage & cost ----------
+   Worth more here than in most chat UIs: the whole history is re-sent on every
+   turn, so a conversation's cost grows with the square of its length rather
+   than linearly, and that is invisible until a bill arrives.
+
+   Every number here is an ESTIMATE and is labelled as one. Token counts come
+   from the same ~4-chars-per-token approximation the context meter uses — the
+   CLI reports no usage figures, so there is nothing exact to read.
+
+   Prices are whatever the operator configured (HERMES_MODEL_PRICES) and
+   nothing is assumed: an unpriced model reports "—", never 0. A confidently
+   wrong cost is worse than no cost, because it gets believed. */
+const USAGE_LS = "hermes_show_usage";
+let showUsage = localStorage.getItem(USAGE_LS) === "1";
+let modelPrices = [];      // [{match, input, output}] per MILLION tokens
+
+function priceFor(model){
+  if(!model) return {free: true};                 // the local model costs nothing to run
+  const key = String(model).toLowerCase();
+  const hit = modelPrices.find(p => key.includes(p.match));
+  return hit ? {input: hit.input, output: hit.output} : null;   // null = unknown
+}
+
+function turnCost(usage){
+  if(!usage) return null;
+  const price = priceFor(usage.model);
+  if(!price) return null;
+  if(price.free) return 0;
+  return (usage.in / 1e6) * price.input + (usage.out / 1e6) * price.output;
+}
+
+function fmtCost(cost){
+  if(cost === null || cost === undefined) return "—";
+  if(cost === 0) return "free";
+  return cost < 0.01 ? `$${cost.toFixed(4)}` : `$${cost.toFixed(2)}`;
+}
+
+function conversationUsage(){
+  let inTok = 0, outTok = 0, cost = 0, unpriced = 0, turns = 0;
+  messages.forEach(m=>{
+    if(!m.usage) return;
+    turns++;
+    inTok += m.usage.in || 0;
+    outTok += m.usage.out || 0;
+    const c = turnCost(m.usage);
+    if(c === null) unpriced++; else cost += c;
+  });
+  return {inTok, outTok, cost, unpriced, turns};
+}
+
+function toggleUsage(){
+  showUsage = !showUsage;
+  try{ localStorage.setItem(USAGE_LS, showUsage ? "1" : "0"); }catch(e){}
+  renderConversation();
+  renderUsage();
+  toast(showUsage ? "Usage shown — counts are estimates" : "Usage hidden");
+}
+
+function renderUsage(){
+  const k=$("#usagek"), el=$("#usagemeter");
+  if(!k || !el) return;
+  k.style.display = showUsage ? "" : "none";
+  el.style.display = showUsage ? "" : "none";
+  if(!showUsage) return;
+  const u = conversationUsage();
+  // Unpriced turns are counted but never folded into the total as zero: the
+  // difference between "this cost nothing" and "nobody told me the price" is
+  // the whole point.
+  const costText = u.unpriced ? (u.turns === u.unpriced ? "—" : `${fmtCost(u.cost)}+?`)
+                              : fmtCost(u.cost);
+  el.textContent = `↑${fmtK(u.inTok)} ↓${fmtK(u.outTok)} · ${costText}`;
+  el.title = `${u.turns} turn${u.turns===1?"":"s"} in this conversation\n`
+           + `sent: ~${fmtK(u.inTok)} tokens (the whole history goes out again every turn)\n`
+           + `received: ~${fmtK(u.outTok)} tokens\n`
+           + (u.unpriced ? `${u.unpriced} turn${u.unpriced===1?"":"s"} on a model with no configured price — see HERMES_MODEL_PRICES\n` : "")
+           + `token counts are estimates (~4 chars/token); cost uses the prices you configured`;
 }
 
 /* ---------- todo panel ----------
@@ -1560,6 +1641,12 @@ function renderMessage(m, i){
   (m.tools||[]).forEach(t=> html+=toolHtml(t));
   if(m.text) html += renderMarkdown(m.text);
   if(m.ts && m.role!=="user") html += `<div class="msgtime">${fmtClock(m.ts)}</div>`;
+  if(showUsage && m.usage){
+    const c=turnCost(m.usage);
+    html += `<div class="msgusage" title="estimated — the CLI reports no usage figures">`
+          + `↑${fmtK(m.usage.in)} ↓${fmtK(m.usage.out)} · ${fmtCost(c)}`
+          + `${m.usage.model ? " · "+esc(m.usage.model) : ""}</div>`;
+  }
   body.innerHTML=html;
   if(m.tripped) body.append(tripCard(m.tripped, i));
   attachMsgActions(body, m, i);
@@ -1959,6 +2046,7 @@ const SLASH_COMMANDS = {
   // Optional argument: /compact <topic> keeps that topic in more detail.
   compact:  { desc:"Fold earlier turns into a summary to free up context", run:(t)=>compactConversation(t), noArg:true },
   compress: { desc:"Alias for /compact", run:(t)=>compactConversation(t), noArg:true },
+  usage:    { desc:"Show or hide token counts and estimated cost", run:()=>toggleUsage(), noArg:true },
 };
 function trySlashCommand(raw){
   const m=raw.match(/^\/(\w+)\b\s*([\s\S]*)$/);
@@ -2036,6 +2124,13 @@ async function send(arg){
     }
     renderConvos();
   }
+
+  // What actually goes out: Hermes' fixed prompt budget, plus the whole
+  // history (re-sent every turn — this is where the quadratic growth lives),
+  // plus this message.
+  const sentTokens = (ctxInfo ? (ctxInfo.base_tokens||0) : 0)
+                   + history.reduce((a,m)=>a+estTokens(m.text)+4, 0)
+                   + estTokens(sendText);
 
   const turnKey = forConvo+"__"+Date.now().toString(36);
   // startedAt is compared against the agent container's start time, so a
@@ -2165,6 +2260,7 @@ async function send(arg){
           // so the user knows the reply didn't come from the model they picked.
           const d=ev.data||{};
           toolLines.push(switchLine(d.from, d.to, d.ts));
+          rec.switchedTo = d.to;      // price the model that actually served it
           status=`Switched to ${d.to} — continuing…`;
           toast(`⚠️ ${d.from} rate-limited — switched to ${d.to}`);
           repaint();
@@ -2201,6 +2297,8 @@ async function send(arg){
     // if the user navigated away while this turn was running.
     let cur = loadMsgs(forConvo);
     cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now(),
+                    usage: {in: sentTokens, out: estTokens(finalText),
+                            model: rec.switchedTo || (selectedModel ? selectedModel.model : "")},
                     ...(rec.tripped ? {tripped:rec.tripped} : {})}];
     saveMsgs(forConvo, cur);
     touchConvo(forConvo, null); renderConvos();
@@ -2284,6 +2382,12 @@ async function fetchModels(){
   try{
     const r=await fetch("/api/models"); const j=await r.json();
     modelOptions = j.options||[];
+    modelPrices = j.prices||[];
+    renderUsage();
+    // Prices arrive after the first paint, so the per-message lines rendered
+    // before this point priced everything as unknown. Repaint them, or the
+    // chip and the transcript disagree about the same turns.
+    if(showUsage) renderConversation();
     if(selectedModel && selectedModel.best){
       // "Best available" always points at whatever is CURRENTLY #1 in the
       // chain — re-derive it fresh rather than matching by identity, since
