@@ -201,7 +201,7 @@
     box-shadow:0 6px 18px rgba(0,0,0,.32)}
   #jumpbtn.show{display:flex}
   #jumpbtn:hover{border-color:var(--accent);color:var(--accent2)}
-  #composer .wrap{display:flex;gap:10px;align-items:flex-end;position:relative}
+  #composer .wrap{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;position:relative}
   #input{flex:1;background:var(--panel2);border:1px solid var(--border);border-radius:10px;color:var(--text);
     font-family:var(--sans);font-size:14px;padding:11px 14px;resize:none;max-height:200px;line-height:1.5;outline:none}
   #input:focus{border-color:var(--accent)}
@@ -219,6 +219,17 @@
   .tool .ts{color:var(--dim)}
   .msgtime{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:6px}
   .msgusage{color:var(--dim);font-family:var(--mono);font-size:10.5px;margin-top:2px}
+  /* order:-1 keeps the tray above the input without depending on where the
+     element sits in the markup. */
+  #attachbar{display:none;flex:0 0 100%;order:-1;flex-wrap:wrap;gap:6px;padding:0}
+  #attachbar.show{display:flex}
+  .achip{display:flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border);
+    border-radius:6px;padding:4px 8px;font-family:var(--mono);font-size:11px;color:var(--muted);max-width:100%}
+  .achip .an{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .achip.pending{opacity:.6}
+  .achip.failed{border-color:var(--red,#c0503a);color:var(--red,#c0503a)}
+  .achip button{background:none;border:none;color:inherit;cursor:pointer;font-size:13px;line-height:1;padding:0}
+  #composer .wrap.dragover{outline:2px dashed var(--accent);outline-offset:3px;border-radius:10px}
   /* Per-message actions. Always rendered rather than revealed on hover: this
      UI is used from a phone as much as a desktop, and a hover-only control
      does not exist on a touch screen. */
@@ -287,6 +298,12 @@
     height:44px;padding:0 12px;cursor:pointer;font-size:12px;font-weight:600;flex:0 0 auto;white-space:nowrap;
     max-width:180px;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:5px}
   #modelbtn:hover{border-color:var(--accent)}
+  /* Matches its neighbours: without a rule of its own it inherited the
+     browser default and rendered as a blank square in the dark theme. */
+  #attachbtn{background:var(--panel2);color:var(--muted);border:1px solid var(--border);
+    border-radius:10px;height:44px;width:44px;flex:0 0 44px;cursor:pointer;font-size:16px;
+    display:flex;align-items:center;justify-content:center;line-height:1}
+  #attachbtn:hover{border-color:var(--accent)}
   #modelbtn.online{background:var(--green-soft);color:var(--green-text);border-color:var(--green)}
   .modelmenu{position:absolute;bottom:100%;right:0;margin-bottom:6px;background:var(--panel2);
     border:1px solid var(--border);border-radius:8px;padding:4px;box-shadow:0 8px 26px var(--shadow);
@@ -541,7 +558,10 @@
     <div id="composer">
       <button id="jumpbtn" title="Jump to the latest output">↓ Latest</button>
       <div class="wrap">
+        <div id="attachbar"></div>
         <textarea id="input" rows="1" placeholder="Command Hermes…  (Enter to send · Shift+Enter for newline)"></textarea>
+        <input id="filepick" type="file" multiple style="display:none" />
+        <button id="attachbtn" title="Attach a file — drag one in or paste a screenshot too">📎</button>
         <button id="modelbtn" title="Pick which model handles the next message">🖥 Local</button>
         <button id="agentbtn" title="Agent mode: push the model to execute multi-step / todo plans to completion in one run">⚡ Agent</button>
         <button id="send" title="Send">➤</button>
@@ -1822,6 +1842,7 @@ function openConvo(id){
   updateCtxMeter();
   syncComposerUI();
   updateQueueBar();
+  renderAttachments();
   recoverPending(id);   // in case this conversation has an interrupted reply
 }
 
@@ -1836,6 +1857,7 @@ function newConvo(){
   updateCtxMeter();
   syncComposerUI();
   updateQueueBar();
+  renderAttachments();
   $("#input").focus();
 }
 
@@ -2078,7 +2100,14 @@ async function send(arg){
     allowTripwires=arg.allow||[];
   } else { sendText=displayText=$("#input").value.trim(); forConvo=activeId; }
   sendText=(sendText||"").trim();
-  if(!sendText) return;
+  // An attachment on its own is a complete instruction ("look at this"), so a
+  // message carrying one is not empty even with no text typed.
+  const preamble = (!isAuto && forConvoHasAttachments()) ? attachmentPreamble(activeId) : "";
+  if(!sendText && !preamble) return;
+  if(preamble){
+    sendText = preamble + sendText;
+    displayText = preamble + displayText;
+  }
   if(!forConvo){ forConvo=newConvoId(); try{ activeId=forConvo; localStorage.setItem(ACTIVE_LS, forConvo); }catch(e){} messages=[]; }
   if(isBusy(forConvo) && !isQueued){
     if(forConvo===activeId) toast("Already running here — try /queue or /steer");
@@ -2131,6 +2160,8 @@ async function send(arg){
   const sentTokens = (ctxInfo ? (ctxInfo.base_tokens||0) : 0)
                    + history.reduce((a,m)=>a+estTokens(m.text)+4, 0)
                    + estTokens(sendText);
+
+  if(preamble) saveAttachments(forConvo, []);   // they are in the history now
 
   const turnKey = forConvo+"__"+Date.now().toString(36);
   // startedAt is compared against the agent container's start time, so a
@@ -2881,6 +2912,127 @@ input.addEventListener("keydown",e=>{
 input.addEventListener("blur",()=>setTimeout(closeSlashMenu,150));   // allow a menu click to register first
 $("#newchat").onclick=()=>{ newConvo(); };
 
+/* ---------- attachments ----------
+   The agent runs in a different container, so a file has to physically get
+   there before a path to it means anything. The server writes it to the
+   webui's state volume and `docker cp`s it across, and the prompt then carries
+   the in-container path — so the agent opens it with the same tools it uses
+   for anything else, rather than the model being handed bytes it cannot act
+   on.
+
+   Pending attachments are stored per conversation, so a phone that reloads
+   mid-compose does not silently drop the file you just picked. */
+const ATTACH_LS = id => "hermes_attach_" + id;
+function loadAttachments(id){ return readJSON(ATTACH_LS(id), []); }
+function saveAttachments(id, list){
+  writeJSON(ATTACH_LS(id), list);
+  if(id === activeId) renderAttachments();
+}
+
+function renderAttachments(){
+  const bar = $("#attachbar");
+  if(!bar) return;
+  const list = loadAttachments(activeId);
+  bar.classList.toggle("show", list.length > 0);
+  bar.innerHTML = list.map((a,i)=>{
+    const cls = a.failed ? "achip failed" : a.path ? "achip" : "achip pending";
+    const label = a.failed ? `${esc(a.name)} — ${esc(a.failed)}`
+                           : `${esc(a.name)}${a.bytes ? " · " + fmtBytes(a.bytes) : " · sending…"}`;
+    return `<span class="${cls}"><span class="an">\u{1F4CE} ${label}</span>`
+         + `<button data-i="${i}" title="Remove">\u00d7</button></span>`;
+  }).join("");
+  bar.querySelectorAll("button").forEach(b=>{
+    b.onclick = ()=>{
+      const list2 = loadAttachments(activeId);
+      list2.splice(+b.dataset.i, 1);
+      saveAttachments(activeId, list2);
+    };
+  });
+}
+
+function fmtBytes(n){
+  if(n < 1024) return n + " B";
+  if(n < 1048576) return (n/1024).toFixed(0) + " KB";
+  return (n/1048576).toFixed(1) + " MB";
+}
+
+async function attachFiles(files){
+  const id = activeId;
+  if(!id){ toast("Start a conversation first"); return; }
+  for(const file of files){
+    const list = loadAttachments(id);
+    // Shown immediately as pending: on a slow link the upload is the part
+    // where a user wonders whether the drop registered at all.
+    list.push({name: file.name || "pasted", bytes: 0, path: ""});
+    saveAttachments(id, list);
+    const slot = loadAttachments(id).length - 1;
+    try{
+      const data = await new Promise((res, rej)=>{
+        const r = new FileReader();
+        r.onload = ()=> res(String(r.result).split(",")[1] || "");
+        r.onerror = ()=> rej(new Error("could not read the file"));
+        r.readAsDataURL(file);
+      });
+      const resp = await fetch("/api/upload", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({name: file.name || "pasted", data, convo: id})
+      });
+      const j = await resp.json().catch(()=>({}));
+      const cur = loadAttachments(id);
+      if(!cur[slot]) continue;                       // removed while uploading
+      if(!resp.ok || !j.path) cur[slot].failed = (j.error || `upload failed (${resp.status})`).slice(0, 60);
+      else { cur[slot].path = j.path; cur[slot].bytes = j.bytes; cur[slot].name = j.name; }
+      saveAttachments(id, cur);
+    }catch(e){
+      const cur = loadAttachments(id);
+      if(cur[slot]){ cur[slot].failed = String(e.message || e).slice(0, 60); saveAttachments(id, cur); }
+    }
+  }
+}
+
+/* The paths go into the message itself rather than only into what is sent, so
+   a follow-up turn ("now edit that file") still has them in the history. */
+$("#attachbtn").onclick = ()=> $("#filepick").click();
+$("#filepick").onchange = (e)=>{
+  if(e.target.files && e.target.files.length) attachFiles([...e.target.files]);
+  e.target.value = "";        // so picking the same file twice still fires
+};
+
+const composerWrap = document.querySelector("#composer .wrap");
+["dragenter","dragover"].forEach(ev=> composerWrap.addEventListener(ev, e=>{
+  e.preventDefault(); composerWrap.classList.add("dragover");
+}));
+["dragleave","drop"].forEach(ev=> composerWrap.addEventListener(ev, e=>{
+  e.preventDefault(); composerWrap.classList.remove("dragover");
+}));
+composerWrap.addEventListener("drop", e=>{
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if(files && files.length) attachFiles([...files]);
+});
+// Screenshots arrive as clipboard items with no filename of their own.
+$("#input").addEventListener("paste", e=>{
+  const items = e.clipboardData && e.clipboardData.items;
+  if(!items) return;
+  const files = [];
+  for(const it of items){
+    if(it.kind !== "file") continue;
+    const f = it.getAsFile();
+    if(f) files.push(f);
+  }
+  if(files.length){ e.preventDefault(); attachFiles(files); }
+});
+
+function forConvoHasAttachments(){
+  return loadAttachments(activeId).some(a => a.path);
+}
+
+function attachmentPreamble(id){
+  const ready = loadAttachments(id).filter(a => a.path);
+  if(!ready.length) return "";
+  return "Attached files (already inside your container — open them with your tools):\n"
+       + ready.map(a => `- ${a.path}`).join("\n") + "\n\n";
+}
+
 /* ---------- installable app ----------
    Registration is deliberately late and failure-tolerant: the worker only adds
    installability and an offline fallback, so nothing here may get in the way
@@ -3050,13 +3202,18 @@ window.addEventListener("pageshow", recoverAllPending);
 
 // Startup: restore the active conversation (or the most recent) from storage.
 (function boot(){
-  if(!activeId || !convos.some(c=>c.id===activeId)){
+  // A conversation only joins `convos` once it has been sent to, so a brand
+  // new chat is normally disposable on reload. It stops being disposable the
+  // moment it holds an attachment somebody uploaded: dropping the id here
+  // orphans a file they can no longer reach.
+  const hasPendingAttachments = activeId && loadAttachments(activeId).length > 0;
+  if(!activeId || (!convos.some(c=>c.id===activeId) && !hasPendingAttachments)){
     activeId = convos.length ? convos[0].id : newConvoId();
   }
   try{ localStorage.setItem(ACTIVE_LS, activeId); }catch(e){}
   messages = loadMsgs(activeId);
   $("#cursession").textContent = convoTitle(activeId) || "New chat";
-  renderConvos(); renderConversation(); health(); fetchContext(); syncComposerUI(); updateQueueBar(); input.focus();
+  renderConvos(); renderConversation(); renderAttachments(); health(); fetchContext(); syncComposerUI(); updateQueueBar(); input.focus();
   applyTheme(document.documentElement.getAttribute("data-theme") || "dark");
   renderMcpBtn(); fetchMcp();
   renderSkillsBtn(); fetchSkills();
