@@ -355,6 +355,66 @@ SESSION_ID_RE = re.compile(r"\d{8}_\d{6}_[0-9a-f]{6}")
 # Strip ANSI escape sequences that the CLI may emit
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
+# ── Credential redaction ─────────────────────────────────────────────────
+# Every turn runs with --yolo, and the agent container carries a dozen
+# long-lived API tokens in its environment. Observed on an ordinary turn: asked
+# which port the webui listens on, the agent went looking, ran
+# `cat /proc/<pid>/environ`, and the whole credential set was rendered into the
+# transcript — from there into the browser's localStorage and into a turn
+# record on disk that outlives `docker compose up -d --build`. No attacker and
+# no crafted prompt; the agent did it while trying to answer.
+#
+# This is DAMAGE LIMITATION, NOT CREDENTIAL SECURITY. The tokens are still
+# sitting where the agent can read them; redaction only stops them being
+# written down again. The actual fix is to not put them there.
+_SECRET_PATTERNS = [
+    # Provider-shaped tokens, matched on their own so they are caught even when
+    # they appear bare — echoed by a tool, pasted into prose — rather than as
+    # NAME=value.
+    ("token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("token", re.compile(r"\bsk-[A-Za-z0-9_-]{16,}")),
+    ("token", re.compile(r"\btvly-[A-Za-z0-9_-]{10,}")),
+    ("token", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+]
+
+# NAME=value where the name looks like a credential. This is the rule that
+# catches an environ dump wholesale — including tokens whose shape nobody
+# anticipated, which is exactly the case that actually happened. The 8-char
+# floor on the value keeps ordinary prose ("MONKEY=banana") out of it.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?P<name>\b[A-Za-z0-9_]*"
+    r"(?:TOKEN|SECRET|API_?KEY|PASSWORD|PASSWD|CREDENTIAL|CLIENT_UID|KEY)\b)"
+    # A JSON key closes its quote before the colon: {"CLICKUP_API_KEY": "..."}.
+    r"[\"']?"
+    r"(?P<sep>\s*[=:]\s*)"
+    r"(?P<q>[\"']?)"
+    # \x00 must be excluded explicitly: `environ` is NUL-separated, not
+    # newline-separated, and \s does not cover NUL — so a greedy value ran
+    # straight through the separator and swallowed every variable after it,
+    # taking their names (and the evidence that anything was hidden) with it.
+    r"(?P<value>[^\s\x00\"',;]{8,})",
+    re.I)
+
+
+def _redact(text: str) -> str:
+    """Remove credential-shaped substrings from anything about to be shown or stored.
+
+    The name is deliberately kept (`GITHUB_TOKEN=<redacted>`): a transcript
+    that quietly loses text is its own debugging problem, and the reader needs
+    to be able to tell "the agent saw nothing" from "the log is hiding it".
+    """
+    if not text:
+        return text
+    for label, rx in _SECRET_PATTERNS:
+        text = rx.sub(f"<redacted:{label}>", text)
+    return _SECRET_ASSIGNMENT_RE.sub(
+        lambda m: f"{m.group('name')}{m.group('sep')}{m.group('q')}"
+                  f"<redacted>{m.group('q')}",
+        text)
+
 
 def _docker(*args: str) -> list[str]:
     return [DOCKER_BIN, *args]
@@ -609,8 +669,9 @@ async def session_transcript(sid: str):
             args = fn.get("arguments")
             if isinstance(args, (dict, list)):
                 args = json.dumps(args)
-            tools.append(f"{name} {str(args or '')[:160]}".strip())
+            tools.append(f"{name} {_redact(str(args or ''))[:160]}".strip())
 
+        content = _redact(content)
         if role == "user" and content:
             # Hide the webui context preamble we prepend to prompts.
             content = PREAMBLE_BLOCK_RE.sub("", content).strip()
@@ -1060,16 +1121,18 @@ async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
                     args = json.dumps(args, ensure_ascii=False)
                 events.append({"kind": "call",
                                "name": fn.get("name") or "?",
-                               "args": str(args or "")[:300]})
+                               "args": _redact(str(args or ""))[:300]})
             if content:
                 if last:
                     final_text = content
                 else:
-                    events.append({"kind": "interim", "text": content[:2000]})
+                    events.append({"kind": "interim", "text": _redact(content)[:2000]})
         elif role == "tool":
+            # The observed leak rode in here: a tool result carrying the
+            # output of `cat /proc/<pid>/environ`.
             events.append({"kind": "result",
-                           "text": content.replace("\n", " ")[:300]})
-    return events, final_text, final_model
+                           "text": _redact(content).replace("\n", " ")[:300]})
+    return events, _redact(final_text), final_model
 
 
 async def _stream_chat(history: list[dict], message: str, session: str,
@@ -1182,7 +1245,11 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 raw = await proc.stdout.readline()
                 if not raw:
                     break
-                line = ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n")
+                # Redacted here, before it is queued OR captured, so the
+                # browser and the on-disk record get the same cleaned text.
+                # Scrubbing only on persist would still hand the secrets to
+                # localStorage, where they would sit indefinitely.
+                line = _redact(ANSI_RE.sub("", raw.decode(errors="replace")).rstrip("\n"))
                 captured.append(line)
                 await q.put(("chunk", record("chunk", {"text": line})))
                 # Mirror the reply to disk as it arrives. The record used to be
@@ -1526,6 +1593,7 @@ _MCP_STDERR_HEADER_RE = re.compile(
 
 
 def _last_stderr_block(log: str, name: str, max_lines: int = 14) -> str:
+    # A server that fails to authenticate often echoes the credential it tried.
     """Last launch block for `name` from mcp-stderr.log, trimmed to max_lines.
 
     Blocks run from one header to the next header for ANY server, so a busy
@@ -1548,7 +1616,7 @@ def _last_stderr_block(log: str, name: str, max_lines: int = 14) -> str:
     if not body:
         return ""
     # The tail carries the exception; the head is usually framework noise.
-    return "\n".join(body[-max_lines:])
+    return _redact("\n".join(body[-max_lines:]))
 
 
 async def _mcp_stderr_tail(name: str) -> str:
