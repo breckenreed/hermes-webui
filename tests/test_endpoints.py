@@ -282,14 +282,6 @@ class TestChatStreaming:
     reply still arrives incrementally and still carries the headers.
     """
 
-    @pytest.fixture
-    def fake_stream(self, monkeypatch):
-        async def _stream(history, message, session, *args, **kwargs):
-            yield b"event: start\ndata: {}\n\n"
-            yield b"event: chunk\ndata: {\"text\": \"hello\"}\n\n"
-            yield b"event: done\ndata: {\"code\": 0}\n\n"
-        monkeypatch.setattr(server, "_stream_chat", _stream)
-
     def test_reply_streams_as_sse(self, client, fake_stream):
         response = client.post("/api/chat",
                                json={"message": "hi", "session": "c_abc__1"})

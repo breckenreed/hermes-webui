@@ -2290,7 +2290,7 @@ async function send(arg){
     return aBody;
   }
   let finalText="";           // accumulated non-tool output
-  let interrupted=false, stopped=false;
+  let interrupted=false, stopped=false, refused=false;
   let status="Processing prompt…";   // shown until real content arrives
   const toolLines=[];
   let lastCallMcp=false;        // was the tool that produced the next result an MCP one?
@@ -2342,6 +2342,16 @@ async function send(arg){
         model:selectedModel?selectedModel.model:"", provider:selectedModel?selectedModel.provider:"",
         allow:allowTripwires}),
       signal:rec.abort.signal});
+    // A refusal (rate limit, bad key) answers with JSON, not a stream. Reading
+    // it as SSE would yield no events and no `done`, so the turn would hang
+    // until the watchdog and then report a network failure — which is not what
+    // happened and not what to do about it.
+    if(!resp.ok){
+      const j = await resp.json().catch(()=>({}));
+      const refused = new Error(j.error || `request refused (${resp.status})`);
+      refused.refused = true;      // nothing started, so nothing to reattach to
+      throw refused;
+    }
     const reader=resp.body.getReader(); const dec=new TextDecoder();
     let buf="";
     while(true){
@@ -2418,7 +2428,14 @@ async function send(arg){
       }
     }
   }catch(e){
-    if(e && e.name==="AbortError" && rec.watchdogAborted){
+    if(e && e.refused){
+      // The server declined before starting anything: no process, no record,
+      // nothing to recover. Treating this as a dropped connection would send
+      // the client off polling /api/turn for a turn that never existed.
+      refused=true;
+      finalText = `_⛔ ${e.message}_`;
+      if(isActive()) toast(e.message);
+    } else if(e && e.name==="AbortError" && rec.watchdogAborted){
       interrupted=true;
       finalText += `${finalText?"\n\n":""}_⚠ connection interrupted — reattaching to the running turn…_`;
     } else if(e && e.name==="AbortError"){
@@ -2458,7 +2475,9 @@ async function send(arg){
     // stick-to-bottom are preserved by renderConversation itself.
     if(isActive()){ renderConversation(); updateCtxMeter(); if(!isAuto) $("#input").focus(); }
 
-    if(interrupted){
+    if(refused){
+      clearPending(forConvo);            // there is no turn on the server to ack
+    } else if(interrupted){
       recoverPending(forConvo);          // start re-asking the server right away
     } else {
       clearPending(forConvo);

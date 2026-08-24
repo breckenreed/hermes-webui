@@ -101,6 +101,16 @@ def fake_run(monkeypatch):
 
 
 @pytest.fixture
+def fake_stream(monkeypatch):
+    """Replace the chat stream generator; the endpoint is what is under test."""
+    async def _stream(history, message, session, *args, **kwargs):
+        yield b"event: start\ndata: {}\n\n"
+        yield b"event: chunk\ndata: {\"text\": \"hello\"}\n\n"
+        yield b"event: done\ndata: {\"code\": 0}\n\n"
+    monkeypatch.setattr(server, "_stream_chat", _stream)
+
+
+@pytest.fixture
 def client():
     from fastapi.testclient import TestClient
 

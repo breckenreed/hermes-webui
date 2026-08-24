@@ -1212,6 +1212,82 @@ def _compose_compact_prompt(history: list[dict], focus: str = "") -> str:
 
 
 # In-flight chat processes, keyed by session, so the UI can stop them.
+# ── Rate limiting ────────────────────────────────────────────────────────
+# Off by default: on a single-user localhost install this should not exist.
+#
+# It earns its place once more than one person shares an inference host. Agent
+# mode auto-continues on its own up to AGENT_MAX_ROUNDS, so a runaway turn does
+# not slow down the person who started it — it takes the model server away from
+# everyone else, and nothing otherwise makes that visible or bounded.
+#
+# Turns are counted, not tokens. The webui cannot see what the model server is
+# actually doing, and a limiter that guessed would be worse than one that
+# counts something it can observe honestly.
+RATE_LIMIT_TURNS = int(os.environ.get("WEBUI_RATE_LIMIT_TURNS", "0"))
+RATE_LIMIT_WINDOW = float(os.environ.get("WEBUI_RATE_LIMIT_WINDOW", "3600"))
+RATE_LIMIT_CONCURRENT = int(os.environ.get("WEBUI_RATE_LIMIT_CONCURRENT", "0"))
+
+# identity -> list of start timestamps, and identity -> set of live turn keys.
+_RATE_STARTS: dict[str, list[float]] = {}
+_RATE_LIVE: dict[str, set] = {}
+
+
+def _identity(request: Request) -> str:
+    """Who this request is, as well as the webui can currently tell.
+
+    A token identifies a person only once tokens are issued per person; until
+    then it identifies the install, and the client address is the better
+    discriminator. Taking whichever is more specific means this keeps working
+    unchanged the day per-person tokens arrive.
+    """
+    if WEBUI_TOKEN:
+        supplied = (request.headers.get("authorization") or "")[7:].strip()
+        if supplied:
+            return "t:" + _token_digest(supplied)
+    return "ip:" + _client_ip(request)
+
+
+def _rate_check(identity: str) -> dict | None:
+    """None if this turn may start, or the reason it may not.
+
+    Reports what the limit is and when it frees up: a bare refusal in the
+    transcript is indistinguishable from the agent being broken.
+    """
+    now = time.time()
+    if RATE_LIMIT_CONCURRENT > 0:
+        live = _RATE_LIVE.get(identity) or set()
+        if len(live) >= RATE_LIMIT_CONCURRENT:
+            return {"error": f"You already have {len(live)} turn"
+                             f"{'s' if len(live) != 1 else ''} running "
+                             f"(limit {RATE_LIMIT_CONCURRENT}). Wait for one to "
+                             f"finish, or stop it.",
+                    "retry_after": 0}
+    if RATE_LIMIT_TURNS > 0:
+        starts = [t for t in _RATE_STARTS.get(identity, [])
+                  if now - t < RATE_LIMIT_WINDOW]
+        _RATE_STARTS[identity] = starts
+        if len(starts) >= RATE_LIMIT_TURNS:
+            wait = int(RATE_LIMIT_WINDOW - (now - starts[0])) + 1
+            return {"error": f"Turn limit reached ({RATE_LIMIT_TURNS} per "
+                             f"{int(RATE_LIMIT_WINDOW / 60)} min). "
+                             f"Try again in {max(wait // 60, 1)} min.",
+                    "retry_after": wait}
+    return None
+
+
+def _rate_started(identity: str, session: str) -> None:
+    _RATE_STARTS.setdefault(identity, []).append(time.time())
+    _RATE_LIVE.setdefault(identity, set()).add(session)
+
+
+def _rate_finished(identity: str, session: str) -> None:
+    live = _RATE_LIVE.get(identity)
+    if live:
+        live.discard(session)
+        if not live:
+            _RATE_LIVE.pop(identity, None)
+
+
 RUNNING: dict[str, asyncio.subprocess.Process] = {}
 
 # Strong references to background tasks (asyncio keeps only weak ones — a
@@ -1594,7 +1670,7 @@ async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
 
 async def _stream_chat(history: list[dict], message: str, session: str,
                        agent_mode: bool = False, model: str = "", provider: str = "",
-                       allow_tripwires: set | None = None):
+                       allow_tripwires: set | None = None, identity: str = ""):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives.
 
     `session` is a unique per-turn key: it isolates this turn's Hermes session
@@ -1638,6 +1714,8 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             stderr=asyncio.subprocess.STDOUT,
         )
     except Exception as e:  # noqa: BLE001
+        if identity:
+            _rate_finished(identity, session)
         yield sse("error", {"message": f"failed to launch hermes: {e}"})
         yield sse("done", {})
         return
@@ -1739,6 +1817,8 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 rc = -1
             if RUNNING.get(session) is proc:
                 del RUNNING[session]
+            if identity:
+                _rate_finished(identity, session)
             # The poller outlives a detached client on purpose; stop it only
             # now that the turn is over and the record is being finalized.
             t = tasks.get("poller")
@@ -2731,7 +2811,7 @@ async def turns_index(limit: int = 40):
 
 
 @app.post("/api/chat")
-async def chat(body: ChatBody):
+async def chat(body: ChatBody, request: Request):
     msg = body.message.strip()
     if not msg:
         return JSONResponse({"error": "empty message"}, status_code=400)
@@ -2742,10 +2822,21 @@ async def chat(body: ChatBody):
     # metacharacter would widen what a later stop kills.
     if not _valid_turn_key(session):
         return JSONResponse({"error": "bad session key"}, status_code=400)
+
+    # Checked before the record is created and before the process is spawned,
+    # so a refusal leaves nothing behind to recover or clean up. Agent-mode
+    # auto-continue arrives here too, which is deliberate: those rounds are the
+    # case that motivates the limit.
+    identity = _identity(request)
+    refusal = _rate_check(identity)
+    if refusal:
+        return JSONResponse(refusal, status_code=429)
+    _rate_started(identity, session)
+
     return StreamingResponse(
         _stream_chat(body.history or [], msg, session, body.agent_mode,
                      body.model.strip(), body.provider.strip(),
-                     set(body.allow or [])),
+                     set(body.allow or []), identity),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
