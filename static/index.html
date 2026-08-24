@@ -6,6 +6,13 @@
 <title>Hermes · WebUI</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231e1813'/%3E%3Cpath d='M16 5l9.5 5.5v11L16 27l-9.5-5.5v-11z' fill='none' stroke='%23e07b39' stroke-width='2.4' stroke-linejoin='round'/%3E%3Cpath d='M12 11v10M20 11v10M12 16h8' stroke='%23f0a868' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E" />
 <meta name="theme-color" content="#16110d" />
+<link rel="manifest" href="/manifest.json" />
+<!-- iOS ignores the manifest for the home-screen icon and uses these instead.
+     It also wants a PNG here; an SVG is not honoured, so an iOS install falls
+     back to a screenshot of the page until a raster icon is added. -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Hermes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <script>
   /* Stamp the theme onto <html> BEFORE any CSS is applied — doing this from the
      main script block instead would paint one frame of the wrong palette and
@@ -2412,6 +2419,18 @@ input.addEventListener("keydown",e=>{
 });
 input.addEventListener("blur",()=>setTimeout(closeSlashMenu,150));   // allow a menu click to register first
 $("#newchat").onclick=()=>{ newConvo(); };
+
+/* ---------- installable app ----------
+   Registration is deliberately late and failure-tolerant: the worker only adds
+   installability and an offline fallback, so nothing here may get in the way
+   of an app that already works. An origin without a service worker (an
+   insecure one that is not localhost, a browser with it disabled) simply keeps
+   working as before. */
+if("serviceWorker" in navigator){
+  window.addEventListener("load", ()=>{
+    navigator.serviceWorker.register("/sw.js").catch(()=>{ /* not fatal */ });
+  });
+}
 
 /* Debounced only for the first keystroke's sake: that one parses every
    conversation to build the cache, and after it the filter is string

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Same mark as the inline favicon, sized for an installed app icon. The
+       padding is deliberate: a maskable icon gets cropped to whatever shape the
+       launcher wants, and a mark drawn edge-to-edge loses its corners. -->
+  <rect width="512" height="512" rx="112" fill="#1e1813"/>
+  <g transform="translate(256 256) scale(11.2) translate(-16 -16)">
+    <path d="M16 5l9.5 5.5v11L16 27l-9.5-5.5v-11z" fill="none" stroke="#e07b39"
+          stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M12 11v10M20 11v10M12 16h8" stroke="#f0a868" stroke-width="2.4"
+          stroke-linecap="round"/>
+  </g>
+</svg>

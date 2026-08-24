@@ -484,3 +484,65 @@ class TestCompact:
         response = client.post("/api/compact", json={"history": self.HISTORY})
         assert response.status_code == 504
         assert any("pkill" in a for call in fake_exec.calls for a in call)
+
+
+class TestPwaAssets:
+    """The three files that make the app installable.
+
+    They are served by hand rather than by mounting static/, because the
+    service worker has to come from the root to control the origin and needs a
+    version stamped in at request time.
+    """
+
+    def test_the_manifest_is_served_with_its_own_type(self, client):
+        response = client.get("/manifest.json")
+        assert response.status_code == 200
+        assert "manifest" in response.headers["content-type"]
+        assert response.json()["start_url"] == "/"
+
+    def test_the_worker_is_served_from_the_root(self, client):
+        """A worker under /static/ would only govern /static/."""
+        response = client.get("/sw.js")
+        assert response.status_code == 200
+        assert "javascript" in response.headers["content-type"]
+        assert response.headers["Service-Worker-Allowed"] == "/"
+
+    def test_the_worker_is_never_cached(self, client):
+        """The browser re-fetches it to notice an update; a cached copy is how
+        an install gets stuck on an old version with no way to tell it."""
+        cache_control = client.get("/sw.js").headers["Cache-Control"]
+        assert "no-store" in cache_control
+
+    def test_the_version_placeholder_is_substituted(self, client):
+        body = client.get("/sw.js").text
+        assert "__VERSION__" not in body
+        assert "hermes-shell-" in body
+
+    def test_the_version_changes_when_the_app_does(self, client, monkeypatch, tmp_path):
+        """A cache name that never changes serves last month's app forever."""
+        first = server._asset_version()
+        (tmp_path / "index.html").write_text("x")
+        (tmp_path / "sw.js").write_text("y")
+        monkeypatch.setattr(server, "STATIC_DIR", tmp_path)
+        assert server._asset_version() != first
+
+    def test_the_worker_never_caches_api_responses(self, client):
+        """Health, sessions and turn records are the live state of an agent
+        running right now; a stale one looks like the truth."""
+        assert '"/api/"' in client.get("/sw.js").text
+
+    def test_the_icon_is_served(self, client):
+        response = client.get("/icon.svg")
+        assert response.status_code == 200
+        assert "svg" in response.headers["content-type"]
+
+    def test_a_missing_asset_is_a_404_not_a_crash(self, client, monkeypatch, tmp_path):
+        monkeypatch.setattr(server, "STATIC_DIR", tmp_path)
+        assert client.get("/manifest.json").status_code == 404
+        assert client.get("/sw.js").status_code == 404
+
+    def test_pwa_assets_do_not_require_the_token(self, client, token):
+        """They are fetched by the browser before any app code runs, and hold
+        nothing private — the same reason the page shell itself is public."""
+        assert client.get("/manifest.json").status_code == 200
+        assert client.get("/sw.js").status_code == 200

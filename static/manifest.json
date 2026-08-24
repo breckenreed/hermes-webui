@@ -1,0 +1,21 @@
+{
+  "id": "/",
+  "name": "Hermes WebUI",
+  "short_name": "Hermes",
+  "description": "Chat interface for a local Hermes agent",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#16110d",
+  "theme_color": "#16110d",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
