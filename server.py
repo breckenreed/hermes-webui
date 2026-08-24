@@ -165,6 +165,47 @@ def _load_tripwires(raw: str) -> list[tuple[str, "re.Pattern"]]:
 
 TRIPWIRES = _load_tripwires(TRIPWIRES_RAW)
 
+# ── Model prices ─────────────────────────────────────────────────────────
+# Deliberately EMPTY by default. Prices change, vary by region and tier, and a
+# number baked in here would be wrong for somebody the day it is written — and
+# a confidently wrong cost is worse than no cost at all, because it gets
+# believed and budgeted against. So the operator supplies the numbers they
+# actually pay, and anything unpriced reports as unknown rather than as free.
+#
+# HERMES_MODEL_PRICES: newline-separated `model=input,output` in currency units
+# per MILLION tokens, e.g.
+#     gemini-3-flash=0.30,2.50
+# The model key is matched as a case-insensitive substring, so a family prefix
+# covers its variants.
+#
+# The local model is free by construction — it runs on hardware you already
+# paid for — so a turn with no model override costs nothing and says so.
+MODEL_PRICES_RAW = os.environ.get("HERMES_MODEL_PRICES", "")
+
+
+def _load_model_prices(raw: str) -> list[dict]:
+    prices = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, rates = line.partition("=")
+        parts = [p.strip() for p in rates.split(",")]
+        if len(parts) != 2:
+            print(f"WARNING: model price {key.strip()!r} needs `input,output`, "
+                  f"ignoring it", flush=True)
+            continue
+        try:
+            prices.append({"match": key.strip().lower(),
+                           "input": float(parts[0]), "output": float(parts[1])})
+        except ValueError:
+            print(f"WARNING: model price {key.strip()!r} is not a number, "
+                  f"ignoring it", flush=True)
+    return prices
+
+
+MODEL_PRICES = _load_model_prices(MODEL_PRICES_RAW)
+
 
 def _tripwire_hit(event: dict, allowed: set) -> tuple[str, str] | None:
     """Which rule this tool call trips, if any — (rule name, matched text).
@@ -1638,7 +1679,10 @@ async def models_info():
     except Exception:  # noqa: BLE001
         pass
 
-    data = {"primary": primary, "options": options}
+    # Prices ride along with the model list: the client already fetches this
+    # to build the picker, and pricing without the model it belongs to is not
+    # useful to anyone.
+    data = {"primary": primary, "options": options, "prices": MODEL_PRICES}
     MODELS_CACHE.update(ts=now, data=data)
     return data
 
