@@ -19,6 +19,7 @@ This container needs the Docker socket mounted (see docker-compose.yml) so it
 can exec into the Hermes container.
 """
 import asyncio
+import hashlib
 import hmac
 import json
 import os
@@ -32,7 +33,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 HERMES_CONTAINER = os.environ.get("HERMES_CONTAINER", "hermes-agent")
@@ -161,8 +162,6 @@ def _token_digest(value: str) -> str:
     the same wrong value again, and keeping user-supplied secrets in memory
     (a mistyped *correct* token, say) is not worth it.
     """
-    import hashlib
-
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -519,6 +518,83 @@ async def _probe_agent_cli(started_at: str) -> tuple[bool, str]:
 
     AGENT_PROBE_CACHE.update(ts=now, ready=ready, detail=detail, started_at=started_at)
     return ready, detail
+
+
+# ── PWA assets ───────────────────────────────────────────────────────────
+# Served by hand rather than by mounting static/: the service worker has to
+# come from the ROOT to control the whole origin (a worker at /static/sw.js
+# only governs /static/), and it needs a version stamped into it at request
+# time. Mounting the directory would also expose every file in it, which is
+# not the same promise as serving three named ones.
+
+def _asset_version() -> str:
+    """A token that changes whenever the app itself changes.
+
+    Derived from the files' own mtimes rather than a hand-maintained constant,
+    because the constant is what gets forgotten — and a service worker whose
+    cache name never changes is a service worker that serves last month's app
+    forever.
+    """
+    stamp = 0.0
+    for name in ("index.html", "sw.js", "manifest.json"):
+        try:
+            stamp += (STATIC_DIR / name).stat().st_mtime
+        except OSError:
+            pass
+    return hashlib.sha256(f"{stamp}".encode()).hexdigest()[:12]
+
+
+def _static_file(name: str, media_type: str, headers: dict | None = None):
+    path = STATIC_DIR / name
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        return JSONResponse({"error": f"{name} not found"}, status_code=404)
+    return Response(body, media_type=media_type, headers=headers or {})
+
+
+@app.get("/manifest.json")
+async def manifest():
+    return _static_file("manifest.json", "application/manifest+json")
+
+
+@app.get("/icon.svg")
+async def icon():
+    return _static_file("icon.svg", "image/svg+xml",
+                        {"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/sw.js")
+async def service_worker():
+    path = STATIC_DIR / "sw.js"
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError:
+        return JSONResponse({"error": "sw.js not found"}, status_code=404)
+    body = body.replace("__VERSION__", _asset_version())
+    return Response(
+        body,
+        media_type="application/javascript",
+        headers={
+            # The worker script itself must never be cached: the browser
+            # re-fetches it to notice an update, and a cached copy is how an
+            # install gets stuck on an old version with no way to tell it.
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            # Explicit, even though /sw.js is already at the root — it
+            # documents that the worker is meant to govern the whole origin.
+            "Service-Worker-Allowed": "/",
+            # The worker gets its OWN policy rather than inheriting the
+            # page's, which carries a per-request nonce — a nonce authorises
+            # inline scripts in a document and means nothing in a worker, so
+            # sending one here is noise in a header that should be readable.
+            # What matters is kept: the worker is pinned to its own origin.
+            # It is the piece of this app with the broadest reach over what
+            # the browser fetches, so it should be the least able to reach
+            # anywhere unexpected.
+            "Content-Security-Policy":
+                "default-src 'self'; script-src 'self'; connect-src 'self'",
+        },
+    )
 
 
 @app.get("/api/health")
