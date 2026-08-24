@@ -1,0 +1,42 @@
+# The suite is hermetic — tests/conftest.py refuses to spawn a real subprocess
+# and points TURNS_DIR at a temp directory — so it needs no Docker, no agent
+# container and no credentials. That is what makes it worth running on every
+# push rather than only before a release.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      # One version failing should not hide the result of the other.
+      fail-fast: false
+      matrix:
+        # 3.12 is what the image ships (see Dockerfile); 3.13 is what
+        # development happens on. Drift between the two is exactly the kind of
+        # break that otherwise surfaces only in production.
+        python: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: python -m pyflakes server.py tests
+
+      - name: Test
+        run: python -m pytest

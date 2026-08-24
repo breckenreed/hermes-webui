@@ -1,0 +1,70 @@
+# Builds the image and checks the container actually serves.
+#
+# The unit suite never touches the Dockerfile or the entrypoint, so a broken
+# base image, a missing dependency or a botched entrypoint would ship happily
+# with a green test run. This is also the check that would have caught a
+# rebuild silently keeping an older, working container: here there is nothing
+# older to fall back to.
+name: docker-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: docker build -t hermes-webui:ci .
+
+      - name: Start
+        # No Docker socket mounted on purpose. The webui must come up and serve
+        # even when it cannot reach an agent — that is the state a user is in
+        # when their agent container is down, and it must not be a crash.
+        run: docker run -d --name webui-ci -p 8000:8000 hermes-webui:ci
+
+      - name: Wait for it to answer
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS -o /dev/null http://localhost:8000/api/health; then
+              echo "answered after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the container never answered on /api/health"
+          docker logs webui-ci
+          exit 1
+
+      - name: It reports the agent as unreachable rather than crashing
+        # Asserting on `state`, not on `docker_available` — the latter only
+        # reports whether the docker CLI binary exists, which it does inside
+        # the image, so it stays true with no socket to talk to.
+        run: |
+          body=$(curl -fsS http://localhost:8000/api/health)
+          echo "$body"
+          echo "$body" | grep -q '"state": *"offline"' \
+            || { echo "::error::expected state=offline with no agent reachable"; exit 1; }
+          echo "$body" | grep -q '"ok": *false' \
+            || { echo "::error::expected ok=false with no agent reachable"; exit 1; }
+
+      - name: The page itself is served
+        run: curl -fsS -o /dev/null http://localhost:8000/
+
+      - name: Security headers survived the build
+        run: |
+          headers=$(curl -fsS -D - -o /dev/null http://localhost:8000/)
+          echo "$headers"
+          for h in "content-security-policy" "x-content-type-options"; do
+            echo "$headers" | tr 'A-Z' 'a-z' | grep -q "$h" \
+              || { echo "::error::missing $h"; exit 1; }
+          done
+
+      - name: Logs
+        if: always()
+        run: docker logs webui-ci
