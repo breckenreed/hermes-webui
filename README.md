@@ -126,6 +126,7 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_COMPACT_DIRECTIVE` | *(built-in default)* | What `/compact` asks the model to produce when folding a conversation into notes |
 | `HERMES_COMPACT_TIMEOUT` | `300` | Seconds a compaction may run before it is abandoned and the container-side process killed |
 | `HERMES_COMPACT_MIN_CHARS` | `80` | Below this, a compaction result is rejected rather than written back as history |
+| `HERMES_TRIPWIRES` | *(built-in list)* | Newline-separated `name=regex` rules matched against tool calls. Empty string disables the feature. See [Tripwires](#tripwires) |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
 | `WEBUI_AUTH_MAX_FAILURES` | `10` | Bad tokens from one IP before it is locked out |
@@ -500,6 +501,47 @@ from drifting as features are added. Names are semantic (`--dim`, `--line`,
 means "accent used as text". Both themes are checked against WCAG AA (4.5:1 for
 body text) — the light theme's accent is deeper than the dark theme's for
 exactly that reason.
+
+## Tripwires
+
+**These fire after the fact. They are not an approval gate, and nothing here
+prevents a command from running.**
+
+`hermes -z --yolo` cannot be paused to ask a question — it is not reading stdin
+while it runs — and a tool call only becomes visible to the webui once Hermes'
+session store has recorded it, which is to say once it has already executed. So
+a tripwire is a smoke alarm, not a lock: it tells you the agent did something
+you flagged, and stops the turn before whatever it was going to do next.
+
+On a match the turn is killed (locally and inside the container) and the
+transcript gets a card naming the rule and the text that matched, with a
+**Continue anyway** button that re-runs the turn with *that one rule* switched
+off and every other rule still armed — the point is getting past a single false
+positive, not disarming the feature.
+
+The default list is deliberately short, because a long one trains people to
+click through the card, and a tripwire that is always ignored is worse than
+none:
+
+| Rule | Catches |
+|---|---|
+| `recursive-delete` | `rm -rf`, `rm -fr` |
+| `force-push` | `git push --force`, `git push -f` |
+| `pipe-to-shell` | `curl … \| sh`, `wget … \| bash` |
+| `read-environment` | `/proc/<pid>/environ`, `printenv` |
+| `disk-write` | `dd if=`, `mkfs`, `> /dev/sd…` |
+| `credential-files` | `.ssh/id_*`, `.aws/credentials`, `.docker/config.json` |
+
+`read-environment` is not hypothetical. Asked which port the webui listens on,
+the agent went looking, ran `cat /proc/<pid>/environ`, and put the container's
+whole credential set into the transcript — which is also why
+[transcripts are redacted](#security-notes).
+
+Only **tool calls** are matched, never results or the model's prose: a rule
+that fired on the agent reading *about* a command is how a detector becomes
+noise. Override the whole list with `HERMES_TRIPWIRES` (newline-separated
+`name=regex`); an empty value turns the feature off. A rule with a bad regex is
+skipped with a startup warning rather than taking the others down with it.
 
 ## Security notes
 
