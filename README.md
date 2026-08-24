@@ -36,6 +36,7 @@ A tiny, self-contained **web chat interface for a local [Hermes Agent](https://h
 - ⚡ **"Use best available" + automatic rate-limit rerouting** — one click starts a turn at the top of your `fallback_providers` hierarchy and lets Hermes' own retry loop cascade through the rest of the chain in-process if a model hits a rate limit, so a single turn can survive several models' quotas being exhausted without you doing anything. Because that switch is otherwise silent (Hermes only prints it to a live console, never to the transcript), the webui detects it by diffing the session's final model against what was requested and shows a persistent, timestamped notice — `⚠️ gemini-3.6-flash was rate-limited — continued on gemini-3-flash-preview` — plus a toast at the moment it happens.
 - 🩺 **Live health that means something** — the dot answers "can the agent take a turn?", not merely "is its container running?". Three states: **green** (container up and the CLI answered), **amber** (container up, agent silent — turns will fail) and **red** (container down). The old check only read `{{.State.Running}}`, so when the agent exited and its restart policy revived it, the light stayed green through the whole outage while every in-flight turn died. The CLI probe is cached so the 15s poll stays cheap, and a **restart is detected within one poll** via the container’s start time: any turn that began before it cannot have survived, so it is cut loose into the normal recovery path immediately instead of waiting out the 45s stream watchdog, and you get told it happened.
 - ⚹ **MCP server visibility** — a top-bar chip shows how many configured MCP servers are healthy; clicking it lists each one's transport, connection state, credential resolution, and every tool it advertises (marking which are actually offered to the agent after `tools.include`/`exclude`). Crucially it separates *reachable* from *authenticated*: an unset `${VAR}` isn't an error to Hermes — it passes the placeholder through literally, so the server starts and lists its tools while every call 401s. That reports as amber "auth required", not green. MCP calls also render distinctly in the transcript as `⚹ server › tool`, with rejected calls flagged. See [MCP servers](#mcp-servers).
+- ⏰ **Scheduled jobs** — a panel over `hermes cron`: list, create, edit-free pause/resume, run-now, remove, and recent run history. **Hermes owns the schedule** — the webui schedules nothing itself, so it stays a layer you can stop, rebuild or leave off without anything silently failing to run. Jobs only fire while the messaging gateway is up, so when it is not, the panel says so in a banner that stays for as long as that is true: a UI that lets you create three jobs which then never run is worse than no UI, because you find out when the thing you scheduled did not happen. See [Scheduled jobs](#scheduled-jobs-1).
 - 🎓 **Skills browser** — a chip listing every skill enabled for the next turn, grouped by category and filterable. Names only: a skill's `SKILL.md` body is read by Hermes on invocation, never by this panel, so browsing costs no context. See [Skills](#skills).
 - 🌗 **Dark & light themes** — "dark roast" and "light crema" on one warm palette, toggled from the top bar, persisted, defaulting to your OS preference and stamped before first paint (no flash). Every colour is a token, and both themes are checked against WCAG AA. See [Theming](#theming).
 - 📲 **Installable (PWA)** — a manifest, an icon and a small service worker, so the webui can be added to a phone's home screen and opened as an app. The worker follows two rules. **API responses are never cached**: health, sessions and turn records are the live state of an agent running right now, and a stale one is worse than an error because it looks like the truth. **Navigations are network-first**: the whole app is one HTML file served with a per-request CSP nonce, so a cache-first shell would eventually serve a page whose inline scripts no longer match the header they arrived with — the cached copy is strictly the offline fallback, which lets you still read past conversations (they live in `localStorage`) when the connection drops. The cache name is derived from the app's own mtimes, so a deploy invalidates it without anyone remembering to bump a constant. iOS ignores the manifest for the home-screen icon and does not honour SVG, so a raster `apple-touch-icon.png` ships alongside it — with square corners, because iOS applies its own mask and a rounded source would be rounded twice.
@@ -545,6 +546,37 @@ turns are unaccounted for, rather than folding the unknown in as zero.
 
 The local model is **free by construction** — it runs on hardware you already
 paid for — so a turn with no model override costs nothing and says `free`.
+
+## Scheduled jobs
+
+Hermes can run prompts on a timer. This is a control panel over its `hermes
+cron` CLI, reached the same way as everything else here — the webui schedules
+nothing itself, which is what keeps it a layer you can stop or rebuild without
+anything silently failing to run.
+
+Two details are load-bearing:
+
+**The list is read with `--all`.** Without it, a paused job disappears from the
+listing — so pausing one would look exactly like deleting it.
+
+**The scheduler state is read from `hermes cron status`, not from the list.**
+The list only prints its gateway warning when there *are* jobs, so inferring
+from it reports "running" on an empty list — precisely when somebody is about
+to create their first job and most needs to be told it will not fire. If the
+status cannot be read at all, the panel warns rather than staying quiet.
+
+Jobs fire only while the messaging gateway runs. When it does not:
+
+```
+The gateway is not running, so scheduled jobs will not fire.
+```
+
+That banner stays for as long as it is true.
+
+Output parsing is defensive, like every other CLI reader here: an unrecognised
+listing reports *"could not read the job list"* rather than *"no jobs"* — those
+look identical on screen and only one of them means the panel is telling the
+truth.
 
 ## Tripwires
 
