@@ -1327,6 +1327,43 @@ async def _latest_cli_session_id() -> str:
         return ""
 
 
+def _todo_state(content: str) -> dict | None:
+    """Full todo state out of a tool result, or None if this is not one.
+
+    The `todo` tool returns the WHOLE list every time, which is why this reads
+    the result rather than the call: a call may be a partial merge
+    (`{"merge": true, "todos": [{"id": "alpha", "status": "completed"}]}`) and
+    carries no way to know what the other items are.
+
+    It is also why the result cannot simply be parsed off the display string —
+    that one is truncated to 300 characters for the transcript, so any real
+    list arrives clipped mid-JSON.
+    """
+    text = (content or "").strip()
+    if not text.startswith("{") or '"todos"' not in text:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    todos = data.get("todos")
+    if not isinstance(todos, list) or not todos:
+        return None
+    items, summary = [], {"total": 0, "done": 0, "doing": 0, "pending": 0}
+    for entry in todos:
+        if not isinstance(entry, dict):
+            return None          # an unexpected shape yields no panel, not a wrong one
+        raw = str(entry.get("status") or "pending").lower()
+        status = ("done" if raw in ("completed", "done")
+                  else "doing" if raw in ("in_progress", "in-progress", "doing", "active")
+                  else "pending")
+        label = entry.get("content") or entry.get("text") or entry.get("id") or ""
+        items.append({"text": _redact(str(label))[:200], "status": status})
+        summary["total"] += 1
+        summary[status] += 1
+    return {"todos": items, "summary": summary, "version": 1}
+
+
 async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
     """Ordered activity of one Hermes session + its final reply text + the
     model that ended up serving it.
@@ -1385,6 +1422,12 @@ async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
             # output of `cat /proc/<pid>/environ`.
             events.append({"kind": "result",
                            "text": _redact(content).replace("\n", " ")[:300]})
+            # A todo result also rides out whole, as its own event. The line
+            # above is a display string and is truncated; the panel needs the
+            # actual list, and every one of these supersedes the last.
+            state = _todo_state(content)
+            if state:
+                events.append({"kind": "todo_state", **state})
     return events, _redact(final_text), final_model
 
 
@@ -1559,7 +1602,8 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 for ev in events[sent:]:
                     ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
-                    await q.put(("tool", ev))
+                    kind = ev.get("kind")
+                    await q.put((kind if kind == "todo_state" else "tool", ev))
                     hit = _tripwire_hit(ev, allowed)
                     if hit:
                         # The command has already run — this cannot prevent it,
@@ -1611,7 +1655,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             # send again. Leaving "tripwire" out of this list is what made the
             # card appear twice: streamed live, then replayed as if it had not
             # been.
-            if kind in ("tool", "model_switch", "tripwire"):
+            if kind in ("tool", "model_switch", "tripwire", "todo_state"):
                 streamed_nonchunk += 1
             yield sse(kind, data)
         poller.cancel()
