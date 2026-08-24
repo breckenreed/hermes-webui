@@ -721,6 +721,26 @@ async def icon():
                         {"Cache-Control": "public, max-age=86400"})
 
 
+# The raster icons are the one place this project keeps binary assets. iOS
+# ignores the manifest for the home-screen icon and does not honour SVG, so
+# without a PNG an installed app shows a screenshot of the page.
+_PNG_ICONS = {"apple-touch-icon.png", "icon-192.png", "icon-512.png"}
+
+
+@app.get("/{name}.png")
+async def png_icon(name: str):
+    filename = f"{name}.png"
+    if filename not in _PNG_ICONS:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    path = STATIC_DIR / filename
+    try:
+        body = path.read_bytes()
+    except OSError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(body, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/sw.js")
 async def service_worker():
     path = STATIC_DIR / "sw.js"
