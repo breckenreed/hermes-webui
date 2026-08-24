@@ -1,0 +1,35 @@
+# Egress control for the Hermes agent — see docs/egress.md.
+#
+# `docker compose -f docker-compose.yml -f docker-compose.egress.yml up -d`
+#
+# This file brings up the proxy and the two networks. The agent itself is NOT
+# defined here — it belongs to its own compose project — so joining it to these
+# networks is a small, documented edit on that side. docs/egress.md has the
+# exact snippet.
+#
+# The enforcement is the NETWORK, not the proxy. `hermes-egress` is marked
+# internal, which means containers on it have no route off the host at all.
+# The proxy is simply the only thing that also sits on a network with a way
+# out. A tool that ignores HTTP_PROXY therefore fails to connect rather than
+# slipping past the allowlist — fail-closed, not advisory.
+
+services:
+  hermes-egress:
+    build:
+      context: ./egress
+    container_name: hermes-egress
+    restart: unless-stopped
+    networks:
+      # The agent's side: no route out.
+      - hermes-egress
+      # The proxy's own way out.
+      - hermes-egress-out
+    # No ports published. Nothing outside the agent network should be able to
+    # use this proxy, and an open forward proxy on a LAN is its own problem.
+
+networks:
+  hermes-egress:
+    name: hermes-egress
+    internal: true
+  hermes-egress-out:
+    name: hermes-egress-out

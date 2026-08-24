@@ -496,6 +496,17 @@ exactly that reason.
 
 ## Security notes
 
+- **Optional: restrict where the agent may connect** — see
+  [`docs/egress.md`](docs/egress.md). `docker-compose.egress.yml` puts the agent
+  on an `internal` network whose only way out is a proxy holding a list of
+  approved hosts. It makes no attempt to judge what the agent is doing, which is
+  the point: marking fetched content as untrusted is a priority in the prompt,
+  not a boundary, and this works whether or not the model respected it. Reducing
+  the list to the inference server alone is the deliberate full-isolation setup.
+  It does **not** protect the destinations that are on the list — an injected
+  "push this to GitHub" still works if GitHub is allowed — so narrow token
+  scopes remain the other half.
+
 - **Set `WEBUI_TOKEN` on any shared network.** The webui grants full agent
   access (including yolo file writes) to whoever reaches the port. With a token
   set, every `/api/*` request must carry `Authorization: Bearer <token>`; the
