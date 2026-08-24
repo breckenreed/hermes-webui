@@ -1,0 +1,24 @@
+# One POSIX extended regex per line, matched against the destination host.
+#
+# ANCHOR EVERY ENTRY. `github\.com$` also matches `evil-github.com`, and
+# `^api\.` also matches `api.anything.example`. The ^…$ pair is the difference
+# between an allowlist and a suggestion.
+#
+# Adding a host here is the documented way to widen egress; it needs no code
+# change and no rebuild of anything but this container.
+
+# ── The inference server ─────────────────────────────────────────────────
+# Nothing works without this one. Replace with your own host or IP.
+^llm\.internal$
+
+# ── APIs the agent's tools reach ─────────────────────────────────────────
+^api\.github\.com$
+^github\.com$
+^codeload\.github\.com$
+^api\.clickup\.com$
+^api\.notion\.com$
+^api\.tavily\.com$
+
+# ── Self-hosted services ─────────────────────────────────────────────────
+# e.g. your Directus instance:
+# ^directus\.internal$
