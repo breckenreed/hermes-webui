@@ -12,13 +12,14 @@
 ^llm\.internal$
 
 # ── APIs the agent's tools reach ─────────────────────────────────────────
+# List the ones your own tools actually call, and nothing else. Every entry
+# here is a place data can leave through, so the list is worth keeping short
+# and worth re-reading when a tool is removed.
 ^api\.github\.com$
 ^github\.com$
 ^codeload\.github\.com$
-^api\.clickup\.com$
-^api\.notion\.com$
-^api\.tavily\.com$
+# ^api\.your-task-tracker\.example$
+# ^api\.your-docs-service\.example$
 
 # ── Self-hosted services ─────────────────────────────────────────────────
-# e.g. your Directus instance:
-# ^directus\.internal$
+# ^internal-service\.example$

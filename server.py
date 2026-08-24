@@ -542,7 +542,7 @@ _SECRET_PATTERNS = [
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?P<name>\b[A-Za-z0-9_]*"
     r"(?:TOKEN|SECRET|API_?KEY|PASSWORD|PASSWD|CREDENTIAL|CLIENT_UID|KEY)\b)"
-    # A JSON key closes its quote before the colon: {"CLICKUP_API_KEY": "..."}.
+    # A JSON key closes its quote before the colon: {"SOME_API_KEY": "..."}.
     r"[\"']?"
     r"(?P<sep>\s*[=:]\s*)"
     r"(?P<q>[\"']?)"
