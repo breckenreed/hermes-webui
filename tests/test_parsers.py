@@ -95,6 +95,58 @@ class TestCompactPrompt:
                 == server._compose_compact_prompt(self.HISTORY, ""))
 
 
+class TestTodoState:
+    """The `todo` tool's result, which is what the plan panel actually tracks.
+
+    It is read from the RESULT rather than the call: a call can be a partial
+    merge (`{"merge": true, "todos": [{"id": "a", "status": "completed"}]}`)
+    that says nothing about the other items, while the result always carries
+    the whole list.
+    """
+
+    FULL = ('{"todos": [{"id": "alpha", "content": "do alpha", "status": "completed"}, '
+            '{"id": "beta", "content": "do beta", "status": "in_progress"}, '
+            '{"id": "gamma", "content": "do gamma", "status": "pending"}], '
+            '"summary": {"total": 3}}')
+
+    def test_reads_the_whole_list(self):
+        state = server._todo_state(self.FULL)
+        assert [t["text"] for t in state["todos"]] == ["do alpha", "do beta", "do gamma"]
+
+    def test_maps_the_statuses_the_tool_actually_emits(self):
+        state = server._todo_state(self.FULL)
+        assert [t["status"] for t in state["todos"]] == ["done", "doing", "pending"]
+        assert state["summary"] == {"total": 3, "done": 1, "doing": 1, "pending": 1}
+
+    def test_a_truncated_payload_yields_nothing(self):
+        """The display copy of a tool result is cut to 300 chars, which lands
+        mid-JSON on any real list. That is the whole reason this is emitted as
+        its own event instead of being scraped off the transcript line."""
+        assert server._todo_state(self.FULL[:120]) is None
+
+    def test_an_ordinary_tool_result_is_not_mistaken_for_a_plan(self):
+        assert server._todo_state('{"output": "hello", "exit_code": 0}') is None
+        assert server._todo_state("ok, done") is None
+        assert server._todo_state("") is None
+
+    def test_an_empty_list_is_not_a_plan(self):
+        assert server._todo_state('{"todos": []}') is None
+
+    def test_an_unexpected_item_shape_yields_no_panel_rather_than_a_wrong_one(self):
+        assert server._todo_state('{"todos": ["alpha", "beta"]}') is None
+
+    def test_a_label_falls_back_when_content_is_missing(self):
+        state = server._todo_state('{"todos": [{"id": "a", "status": "pending"}, '
+                                   '{"id": "b", "text": "written", "status": "pending"}]}')
+        assert [t["text"] for t in state["todos"]] == ["a", "written"]
+
+    def test_labels_are_redacted_like_any_other_agent_output(self):
+        state = server._todo_state(
+            '{"todos": [{"id": "1", "content": "use GITHUB_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", '
+            '"status": "pending"}, {"id": "2", "content": "second", "status": "pending"}]}')
+        assert "ghp_AAAA" not in state["todos"][0]["text"]
+
+
 class TestDefaultPreamble:
     """The built-in note must stay installation-agnostic.
 

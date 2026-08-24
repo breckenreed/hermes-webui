@@ -1241,19 +1241,28 @@ function parseTodos(text){
   if(items.length < TODO_MIN_ITEMS) return null;
   const summary = {total: items.length, done: 0, doing: 0, pending: 0};
   items.forEach(i=> summary[i.status]++);
-  return {items, summary, version: 1};
+  // Keyed `todos`, matching what the server sends for a tool-driven list.
+  // Two names for one shape is what broke this: every server update threw.
+  return {todos: items, summary, version: 1};
 }
 
+/* Freshest first. The tool beats prose wherever both exist: the agent updates
+   its list by calling `todo`, and the reply text is usually written once at the
+   start and never restated — which is exactly why the panel used to freeze at
+   the plan's opening state for a whole run. */
 function currentTodos(liveText){
-  // A turn in flight is the freshest truth about the plan.
+  const inflight = inFlight.get(activeId);
+  if(inflight && inflight.todoState) return inflight.todoState;
   const live = parseTodos(liveText);
   if(live) return live;
-  // Otherwise the newest message that still carries a list — scanning back
+  // Otherwise the newest message carrying either kind of list — scanning back
   // rather than reading only the last one, so the panel does not blink out
-  // during a round where the model happens not to restate the plan.
+  // during a round where nothing about the plan was said or touched.
   for(let i = messages.length - 1; i >= 0; i--){
-    if(messages[i].role === "user" || messages[i].role === "compact") continue;
-    const parsed = parseTodos(messages[i].text);
+    const m = messages[i];
+    if(m.role === "user" || m.role === "compact") continue;
+    if(m.todoState) return m.todoState;
+    const parsed = parseTodos(m.text);
     if(parsed) return parsed;
   }
   return null;
@@ -1266,9 +1275,10 @@ function renderTodos(liveText){
   if(!state){ bar.classList.remove("show"); bar.innerHTML=""; return; }
 
   const closed = readJSON(TODO_LS, false) === true;
-  const {items, summary} = state;
+  const {todos, summary} = state;
+  if(!Array.isArray(todos) || !todos.length){ bar.classList.remove("show"); bar.innerHTML=""; return; }
   bar.className = "show" + (closed ? " closed" : "");
-  const rows = items.map(i=>{
+  const rows = todos.map(i=>{
     const box = i.status === "done" ? "[x]" : i.status === "doing" ? "[~]" : "[ ]";
     return `<div class="titem ${i.status}"><span class="box">${box}</span>`
          + `<span class="txt">${esc(i.text)}</span></div>`;
@@ -2277,6 +2287,12 @@ async function send(arg){
             status="Generating…";
           }
           repaint();
+        } else if(ev.event==="todo_state"){
+          // The agent touched its list. This supersedes anything parsed out of
+          // prose, and arrives on every change rather than only when the model
+          // chooses to reprint the plan.
+          rec.todoState = ev.data;
+          if(isActive()) renderTodos();
         } else if(ev.event==="tripwire"){
           // The server has already killed the turn by the time this arrives.
           // It is a report, not a prompt: the command ran.
@@ -2330,6 +2346,7 @@ async function send(arg){
     cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now(),
                     usage: {in: sentTokens, out: estTokens(finalText),
                             model: rec.switchedTo || (selectedModel ? selectedModel.model : "")},
+                    ...(rec.todoState ? {todoState: rec.todoState} : {}),
                     ...(rec.tripped ? {tripped:rec.tripped} : {})}];
     saveMsgs(forConvo, cur);
     touchConvo(forConvo, null); renderConvos();
@@ -3129,20 +3146,24 @@ function setPending(id, turnKey){ const p=getPending(); p[id]=turnKey; writeJSON
 function clearPending(id){ const p=getPending(); delete p[id]; writeJSON(PENDING_LS, p); }
 
 function rebuildFromRecord(j){
-  const tools=[]; const interims=[];
+  const tools=[]; const interims=[]; let todoState=null;
   let lastCallMcp=false;   // mirrors send()'s live pass so replays render alike
   (j.events||[]).forEach(d=>{
     if(d.kind==="call"){ tools.push(callLine(d)); lastCallMcp=!!mcpParts(d.name); }
     else if(d.kind==="result") tools.push(resultLine(d, lastCallMcp).line);
     else if(d.kind==="interim" && d.text) interims.push(d.text);
     else if(d.kind==="model_switch") tools.push(switchLine(d.from, d.to, d.ts));
+    // Last one wins: the tool reports the whole list on every change.
+    else if(d.kind==="todo_state" && d.todos) todoState={todos:d.todos, summary:d.summary, version:1};
     // "chunk" events are the final reply — covered by j.text
   });
   const parsed=parseTurn(j.text||"");
   parsed.toolLines.forEach(t=>tools.push(t));
   let text=interims.join("\n\n");
   if(parsed.finalText) text += (text?"\n\n":"") + parsed.finalText;
-  return {text, tools};
+  // Omitted rather than nulled: applyToConvo spreads this straight onto the
+  // stored message, and a null property on every recovered turn is noise.
+  return {text, tools, ...(todoState ? {todoState} : {})};
 }
 
 // Applies a recovered result to the conversation it belongs to (`id`) via
