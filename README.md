@@ -133,6 +133,7 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_AGENT_ATTACH_DIR` | `/tmp/hermes-webui-attachments` | Where attachments are placed **inside the agent container**. Deliberately not the workspace |
 | `UPLOADS_DIR` | `/app/state/uploads` | The durable copy, on the state volume. Falls back to a temp dir if unwritable |
 | `HERMES_MODEL_PRICES` | *(empty)* | Newline-separated `model=input,output` per **million** tokens, for `/usage`. Empty means every non-local model reports unknown rather than free. See [Usage and cost](#usage-and-cost) |
+| `HERMES_VERDICT_TIMEOUT` | `6` | Seconds to wait for the agent's own verdict on a command before falling back to the built-in patterns |
 | `HERMES_TRIPWIRES` | *(built-in list)* | Newline-separated `name=regex` rules matched against tool calls. Empty string disables the feature. See [Tripwires](#tripwires) |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
@@ -562,9 +563,28 @@ transcript gets a card naming the rule and the text that matched, with a
 off and every other rule still armed — the point is getting past a single false
 positive, not disarming the feature.
 
-The default list is deliberately short, because a long one trains people to
-click through the card, and a tripwire that is always ignored is worse than
-none:
+**The agent is asked first.** `hermes approvals test` runs Hermes' own
+dangerous-command detector without executing anything, and returns one of three
+verdicts with the rule that matched:
+
+- `allow` — no guard matched.
+- `ask-approval` — would normally raise an interactive prompt. Under `--yolo`,
+  which this webui always passes, that prompt is bypassed and the command runs.
+- `hardline-deny` — *"never bypassable, blocked even under `--yolo`"*. The agent
+  refuses this one itself, so seeing it means the agent tried something it will
+  not be allowed to do.
+
+Asking beats guessing: it evaluates normalised variants of the command — the
+quoting and spacing tricks a flat pattern misses — and the rules stay in step
+with the agent across upgrades. The card says whose rule fired.
+
+The built-in patterns below remain as the floor, for when that subcommand is
+missing, the container is unreachable, or the verdict does not arrive within
+`HERMES_VERDICT_TIMEOUT`. **A failure to ask is never treated as an all-clear.**
+
+They also catch things the agent does not consider dangerous but that matter
+here — reading an environment file is an ordinary read to the agent and a
+credential leak to us:
 
 | Rule | Catches |
 |---|---|
