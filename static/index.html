@@ -1625,8 +1625,8 @@ function toolHtml(t){
 /* ---------- MCP calls in the transcript ----------
    Hermes registers MCP tools as `mcp__<server>__<tool>`, which is unreadable
    inline and hides WHICH server an action went to. These render them as
-   `⚹ server › tool` (blue), so an external side effect — a ClickUp task being
-   created, say — is never mistaken for a local builtin, and a failure can be
+   `⚹ server › tool` (blue), so an external side effect — a ticket created in
+   some other system, say — is never mistaken for a local builtin, and a failure can be
    traced to a specific server in the MCP panel. Both the live SSE path and the
    reattach/replay path build their lines here so a recovered transcript looks
    identical to a live one. */
@@ -2638,7 +2638,7 @@ function renderMcpPanel(){
     // command that dies on launch surfaces to the client only as a closed pipe
     // — this log is the one place the actual traceback exists, and showing it
     // is the difference between "Connection closed" and "FileNotFoundError:
-    // clickup-mcp". Only rendered when something is actually wrong.
+    // some-mcp-server". Only rendered when something is actually wrong.
     const stderrHtml=(sv.stderr_tail||"").trim() ? `
       <div class="mcpsec">
         <h4>Server stderr — last launch</h4>

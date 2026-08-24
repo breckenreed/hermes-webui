@@ -657,10 +657,10 @@ skipped with a startup warning rather than taking the others down with it.
 - **The Hermes ↔ LLM leg is separate.** The webui never talks to the LLM —
   `webui ↔ hermes` is a local `docker exec` on the same machine. But Hermes
   itself calls your LM Studio server over the LAN with a bearer key; to protect
-  that hop, put both machines on a [Tailscale](https://tailscale.com) tailnet
-  (WireGuard-encrypted) and point Hermes' `base_url` at the tailnet address,
-  or use an SSH tunnel. An LM Studio *client* install cannot act as a relay
-  for other apps.
+  that hop, keep both machines on the same private, encrypted network — a
+  WireGuard mesh or an SSH tunnel — and point Hermes' `base_url` at that
+  address rather than at a bare LAN IP. An LM Studio *client* install cannot
+  act as a relay for other apps.
 
 ## Tests
 

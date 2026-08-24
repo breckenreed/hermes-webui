@@ -98,8 +98,8 @@ class TestProbe:
 # Values here are invented; the shapes are the ones that showed up.
 ENVIRON_DUMP = (
     "GITHUB_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00"
-    "TAVILY_API_KEY=tvly-dev-BBBBBBBBBBBBBBBB\x00"
-    "CLICKUP_API_KEY=pk_12345_CCCCCCCCCCCCCCCCCCCC\x00"
+    "SEARCH_API_KEY=tvly-dev-BBBBBBBBBBBBBBBB\x00"
+    "TRACKER_API_KEY=pk_12345_CCCCCCCCCCCCCCCCCCCC\x00"
     "HOSTNAME=hermes-agent\x00PATH=/usr/local/bin:/usr/bin"
 )
 
@@ -116,7 +116,7 @@ class TestRedaction:
         hidden"."""
         out = server._redact(ENVIRON_DUMP)
         assert "GITHUB_TOKEN=" in out
-        assert "TAVILY_API_KEY=" in out
+        assert "SEARCH_API_KEY=" in out
         assert "<redacted>" in out
 
     def test_harmless_variables_are_left_alone(self):
@@ -145,7 +145,7 @@ class TestRedaction:
 
     def test_a_quoted_json_value(self):
         """Tool results arrive as JSON far more often than as shell output."""
-        out = server._redact('{"CLICKUP_API_KEY": "pk_99999_DDDDDDDDDDDDDDDDDDDD"}')
+        out = server._redact('{"TRACKER_API_KEY": "pk_99999_DDDDDDDDDDDDDDDDDDDD"}')
         assert "pk_99999_DDDD" not in out
         assert '"<redacted>"' in out
 
