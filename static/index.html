@@ -250,6 +250,13 @@
   .compactmsg .chead .ctoggle{margin-left:auto;color:var(--accent2)}
   .compactmsg .cbody{display:none;padding:2px 12px 10px;font-size:13.5px;color:var(--text)}
   .compactmsg.open .cbody{display:block}
+  .tripcard{margin:10px 0;border:1px solid var(--red,#c0503a);border-left:3px solid var(--red,#c0503a);
+    border-radius:7px;background:var(--panel2);padding:10px 12px}
+  .tripcard .th{font-family:var(--mono);font-size:11.5px;color:var(--red,#c0503a)}
+  .tripcard .tm{font-family:var(--mono);font-size:12px;color:var(--text);margin:6px 0;
+    word-break:break-all;background:var(--code);border:1px solid var(--border);
+    border-radius:5px;padding:6px 8px}
+  .tripcard .tn{font-size:12px;color:var(--muted);margin-bottom:8px}
   .compactbusy{margin:12px 0;padding:8px 10px;border:1px dashed var(--border);border-radius:6px;
                background:var(--panel2);font-family:var(--mono);font-size:11.5px;color:var(--muted)}
   .status{color:var(--muted);font-size:13px;font-family:var(--mono);margin:6px 0;animation:pulse 1.6s ease-in-out infinite}
@@ -1457,6 +1464,7 @@ function renderMessage(m, i){
   if(m.text) html += renderMarkdown(m.text);
   if(m.ts && m.role!=="user") html += `<div class="msgtime">${fmtClock(m.ts)}</div>`;
   body.innerHTML=html;
+  if(m.tripped) body.append(tripCard(m.tripped, i));
   attachMsgActions(body, m, i);
 }
 
@@ -1558,6 +1566,41 @@ function startEdit(body, m, i, id){
     if(e.key==="Escape"){ e.preventDefault(); cancel(); }
     else if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); save(); }
   });
+}
+
+/* A tripwire card reports what already happened. The wording matters more than
+   the styling here: calling this "blocked" would be a lie the architecture
+   cannot back — hermes -z --yolo cannot be paused to ask, so by the time the
+   webui sees a tool call it has run. What was actually prevented is whatever
+   the agent intended to do next. */
+function tripCard(trip, i){
+  const el=document.createElement("div"); el.className="tripcard";
+  el.innerHTML=`<div class="th">\u26D4 Tripwire: ${esc(trip.rule)}</div>`
+             + `<div class="tn">The turn was stopped after this ran. It was not prevented.</div>`
+             + `<div class="tm">${esc(trip.tool)} \u2192 ${esc(trip.match)}</div>`
+             + `<button class="mact" data-a="anyway" title="Re-run this turn with only this rule switched off">\u21bb Continue anyway</button>`;
+  el.querySelector('[data-a="anyway"]').onclick=(e)=>{
+    e.stopPropagation();
+    continueAnyway(trip.rule, i);
+  };
+  return el;
+}
+
+/* Re-runs the turn with THIS rule suppressed and every other one still armed —
+   the point is to get past one specific false positive, not to disarm the
+   feature because one rule was noisy. */
+function continueAnyway(rule, index){
+  const id=activeId;
+  if(!canRewrite(id)) return;
+  const msgs=loadMsgs(id);
+  let i=Math.min(index, msgs.length-1);
+  while(i>=0 && msgs[i].role!=="user") i--;
+  if(i<0){ toast("Nothing to re-run"); return; }
+  const text=msgs[i].text;
+  saveMsgs(id, msgs.slice(0, i));
+  if(id===activeId){ renderConversation(); updateCtxMeter(); }
+  send({text, convoId:id, allow:[rule]});
+  toast(`Re-running with "${rule}" switched off for this turn`);
 }
 
 function renderCompactAnchor(text, ts, m){
@@ -1842,11 +1885,12 @@ function trySlashCommand(raw){
                                           to, never whichever one is on screen
                                           when the promise settles) */
 async function send(arg){
-  let sendText, displayText, forConvo, isAuto=false, isQueued=false;
+  let sendText, displayText, forConvo, isAuto=false, isQueued=false, allowTripwires=[];
   if(typeof arg==="string"){ sendText=displayText=arg; forConvo=activeId; isAuto=true; }
   else if(arg && typeof arg==="object"){
     sendText=arg.text; displayText=arg.displayText ?? arg.text;
     forConvo=arg.convoId||activeId; isAuto=!!arg.isAuto; isQueued=!!arg.isQueued;
+    allowTripwires=arg.allow||[];
   } else { sendText=displayText=$("#input").value.trim(); forConvo=activeId; }
   sendText=(sendText||"").trim();
   if(!sendText) return;
@@ -1961,7 +2005,8 @@ async function send(arg){
   try{
     const resp=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({message:sendText, session:turnKey, history, agent_mode:agentMode,
-        model:selectedModel?selectedModel.model:"", provider:selectedModel?selectedModel.provider:""}),
+        model:selectedModel?selectedModel.model:"", provider:selectedModel?selectedModel.provider:"",
+        allow:allowTripwires}),
       signal:rec.abort.signal});
     const reader=resp.body.getReader(); const dec=new TextDecoder();
     let buf="";
@@ -2008,6 +2053,14 @@ async function send(arg){
             status="Generating…";
           }
           repaint();
+        } else if(ev.event==="tripwire"){
+          // The server has already killed the turn by the time this arrives.
+          // It is a report, not a prompt: the command ran.
+          const d=ev.data||{};
+          rec.tripped={rule:d.rule||"?", match:d.match||"", tool:d.tool||"?"};
+          toolLines.push(`⛔ tripwire ${d.rule} — turn stopped`);
+          status="Stopped by a tripwire";
+          repaint();
         } else if(ev.event==="model_switch"){
           // Hermes' own fallback chain swapped models mid-turn (rate limit /
           // billing / connection failure) and kept generating — surface it
@@ -2049,7 +2102,8 @@ async function send(arg){
     // `messages`/`activeId`, which may now point at a different conversation
     // if the user navigated away while this turn was running.
     let cur = loadMsgs(forConvo);
-    cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now()}];
+    cur = [...cur, {role:"assistant", text:finalText, tools:toolLines, ts:Date.now(),
+                    ...(rec.tripped ? {tripped:rec.tripped} : {})}];
     saveMsgs(forConvo, cur);
     touchConvo(forConvo, null); renderConvos();
     // renderConversation, not repaint: repaint only rewrites the streaming

@@ -118,6 +118,72 @@ COMPACT_DIRECTIVE = os.environ.get("HERMES_COMPACT_DIRECTIVE", _DEFAULT_COMPACT_
 # wedged run cannot hold a request open forever.
 COMPACT_TIMEOUT = float(os.environ.get("HERMES_COMPACT_TIMEOUT", "300"))
 
+# ── Tripwires ────────────────────────────────────────────────────────────
+# READ THIS BEFORE TRUSTING IT: these fire AFTER the fact. `hermes -z --yolo`
+# cannot be paused to ask a question — it is not reading stdin while it runs —
+# and a tool call only becomes visible here once the session store has already
+# recorded it, which is to say once it has already run. So this is a smoke
+# alarm, not a lock: it tells you the agent did something you flagged, and
+# stops the turn before whatever came next. It is not an approval gate and
+# must never be described as one.
+#
+# The default list is deliberately short. A long list trains people to click
+# through the card, and a tripwire that is always ignored is worse than none.
+# The environ entry is not hypothetical: asked which port the webui listens on,
+# the agent ran `cat /proc/<pid>/environ` and put the container's whole
+# credential set into the transcript.
+#
+# Override with HERMES_TRIPWIRES: newline-separated `name=regex` lines. An
+# empty string disables the feature entirely.
+_DEFAULT_TRIPWIRES = "\n".join([
+    r"recursive-delete=\brm\s+(?:-\w+\s+)*-\w*[rR]\w*f|\brm\s+(?:-\w+\s+)*-\w*f\w*[rR]",
+    r"force-push=\bgit\s+push\b[^\n]*(--force|(?<!-)-f\b)",
+    r"pipe-to-shell=\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba|z|d|k)?sh\b",
+    r"read-environment=/proc/\S*/environ|\bprintenv\b",
+    r"disk-write=\bdd\s+if=|\bmkfs\b|>\s*/dev/(sd|nvme|disk)",
+    r"credential-files=\.ssh/id_|\.aws/credentials|\.docker/config\.json",
+])
+TRIPWIRES_RAW = os.environ.get("HERMES_TRIPWIRES", _DEFAULT_TRIPWIRES)
+
+
+def _load_tripwires(raw: str) -> list[tuple[str, "re.Pattern"]]:
+    """Parse `name=regex` lines. A bad line is skipped loudly rather than
+    taking the server down: a typo in one rule must not disable the rest."""
+    rules = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, pattern = line.partition("=")
+        try:
+            rules.append((name.strip(), re.compile(pattern, re.I)))
+        except re.error as exc:
+            print(f"WARNING: tripwire {name.strip()!r} has a bad regex, "
+                  f"ignoring it: {exc}", flush=True)
+    return rules
+
+
+TRIPWIRES = _load_tripwires(TRIPWIRES_RAW)
+
+
+def _tripwire_hit(event: dict, allowed: set) -> tuple[str, str] | None:
+    """Which rule this tool call trips, if any — (rule name, matched text).
+
+    Only `call` events are examined. A rule that matched a tool *result* would
+    fire on the agent merely reading about a command, which is how a detector
+    becomes noise.
+    """
+    if event.get("kind") != "call":
+        return None
+    haystack = f"{event.get('name', '')} {event.get('args', '')}"
+    for name, rx in TRIPWIRES:
+        if name in allowed:
+            continue
+        m = rx.search(haystack)
+        if m:
+            return name, m.group(0)[:120]
+    return None
+
 # Markers wrap the preamble in the sent prompt so we can strip it back out when
 # rendering a stored transcript — the user only ever sees their own text.
 PREAMBLE_OPEN = "<<webui-context>>"
@@ -442,6 +508,7 @@ class ChatBody(BaseModel):
     agent_mode: bool = False          # add completion pressure for multi-step / todo work
     model: str = ""                   # per-turn model override (blank = Hermes' configured default)
     provider: str = ""                # per-turn provider override, paired with `model`
+    allow: list[str] = []             # tripwire rules to suppress for THIS turn
 
 
 # index.html is a single 100KB file served on every page load, so it is read
@@ -1212,7 +1279,8 @@ async def _export_turn(sid: str) -> tuple[list[dict], str, str]:
 
 
 async def _stream_chat(history: list[dict], message: str, session: str,
-                       agent_mode: bool = False, model: str = "", provider: str = ""):
+                       agent_mode: bool = False, model: str = "", provider: str = "",
+                       allow_tripwires: set | None = None):
     """Run the Hermes one-shot CLI and yield SSE events as output arrives.
 
     `session` is a unique per-turn key: it isolates this turn's Hermes session
@@ -1234,6 +1302,7 @@ async def _stream_chat(history: list[dict], message: str, session: str,
         "--resume", session,
         "--yolo", "--cli",
     ]
+    allowed = allow_tripwires or set()
     requested_model = model or DEFAULT_MODEL   # for mid-turn switch detection below
     if requested_model:
         args += ["-m", requested_model]
@@ -1292,6 +1361,14 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                 for ev in events[known:]:
                     ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
+                    # Nothing left to kill here — the process is already gone.
+                    # Recording it still matters: a turn that tripped a wire
+                    # should say so even when it beat the poller to the end.
+                    hit = _tripwire_hit(ev, allowed)
+                    if hit and not rec.get("tripped"):
+                        rec["tripped"] = hit[0]
+                        record("tripwire", {"rule": hit[0], "match": hit[1],
+                                            "tool": ev.get("name", "?")})
                 if not rec["text"] and final_text:
                     rec["text"] = final_text
                 # Hermes' own fallback chain (try_activate_fallback) swaps
@@ -1373,6 +1450,25 @@ async def _stream_chat(history: list[dict], message: str, session: str,
                     ev.setdefault("ts", time.time())
                     rec["events"].append(ev)
                     await q.put(("tool", ev))
+                    hit = _tripwire_hit(ev, allowed)
+                    if hit:
+                        # The command has already run — this cannot prevent it,
+                        # only stop whatever the agent was going to do next.
+                        # See the note on _DEFAULT_TRIPWIRES.
+                        trip = record("tripwire", {"rule": hit[0], "match": hit[1],
+                                                   "tool": ev.get("name", "?")})
+                        rec["tripped"] = hit[0]
+                        await q.put(("tripwire", trip))
+                        _persist_turn(session, rec)
+                        proc_now = RUNNING.get(session)
+                        if proc_now is not None:
+                            try:
+                                proc_now.kill()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        await _kill_container_chat(session)
+                        sent = len(events)
+                        return
                 if len(events) > sent:
                     sent = len(events)
                     rec["ts"] = time.time()
@@ -1401,7 +1497,11 @@ async def _stream_chat(history: list[dict], message: str, session: str,
             if kind == "eof":
                 rc = data.get("code", 0)
                 break
-            if kind in ("tool", "model_switch"):
+            # Anything counted here is one the replay loop below must NOT
+            # send again. Leaving "tripwire" out of this list is what made the
+            # card appear twice: streamed live, then replayed as if it had not
+            # been.
+            if kind in ("tool", "model_switch", "tripwire"):
                 streamed_nonchunk += 1
             yield sse(kind, data)
         poller.cancel()
@@ -2326,7 +2426,8 @@ async def chat(body: ChatBody):
         return JSONResponse({"error": "bad session key"}, status_code=400)
     return StreamingResponse(
         _stream_chat(body.history or [], msg, session, body.agent_mode,
-                     body.model.strip(), body.provider.strip()),
+                     body.model.strip(), body.provider.strip(),
+                     set(body.allow or [])),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
