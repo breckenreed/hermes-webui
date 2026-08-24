@@ -19,6 +19,7 @@ This container needs the Docker socket mounted (see docker-compose.yml) so it
 can exec into the Hermes container.
 """
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -205,6 +206,54 @@ def _load_model_prices(raw: str) -> list[dict]:
 
 
 MODEL_PRICES = _load_model_prices(MODEL_PRICES_RAW)
+
+# ── Attachments ──────────────────────────────────────────────────────────
+# Files are uploaded as base64 inside JSON rather than as multipart form data.
+# Multipart would mean adding python-multipart, and the runtime image is four
+# packages on purpose; base64 costs a third more bytes on a capped upload and
+# nothing else.
+#
+# Two placement rules, both deliberate:
+#   * The durable copy lives under the state volume, next to turn records —
+#     NOT in the container filesystem, which every `up -d --build` discards.
+#   * The copy the agent sees goes to a directory of its own, never the
+#     workspace. An attachment that lands wherever the agent happens to be
+#     working turns "here is a file to look at" into an edit to the project.
+MAX_UPLOAD_MB = float(os.environ.get("HERMES_MAX_UPLOAD_MB", "20"))
+AGENT_ATTACH_DIR = os.environ.get("HERMES_AGENT_ATTACH_DIR",
+                                  "/tmp/hermes-webui-attachments")
+
+
+def _resolve_upload_dir() -> Path:
+    for candidate in (Path(os.environ.get("UPLOADS_DIR", "")) if os.environ.get("UPLOADS_DIR")
+                      else None, Path("/app/state/uploads"),
+                      Path(tempfile.gettempdir()) / "hermes-webui-uploads"):
+        if candidate is None:
+            continue
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".writable"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir())
+
+
+UPLOADS_DIR = _resolve_upload_dir()
+
+# A filename becomes a path segment on both sides of a `docker cp`, so it is
+# rebuilt from scratch rather than sanitised: anything outside this set is
+# dropped, which rules out traversal, shell metacharacters and a leading dash
+# that a CLI would read as a flag.
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = _SAFE_NAME_RE.sub("_", (name or "").strip())[-80:]
+    cleaned = cleaned.lstrip(".-") or "file"
+    return cleaned
 
 
 def _tripwire_hit(event: dict, allowed: set) -> tuple[str, str] | None:
@@ -2598,6 +2647,81 @@ async def compact(body: CompactBody):
             status_code=502)
     return {"summary": summary, "chars": len(summary),
             "turns": len(turns), "model": model, "code": code}
+
+
+class UploadBody(BaseModel):
+    name: str
+    data: str = ""            # base64; multipart would cost a fifth runtime dep
+    convo: str = ""
+
+
+@app.post("/api/upload")
+async def upload(body: UploadBody, request: Request):
+    """Take a file and put a copy where the agent can open it.
+
+    The agent lives in a different container, so the file is written to the
+    webui's own state volume and then `docker cp`-ed across. That needs no
+    change to the agent's deployment, which this project does not own — the
+    same reason everything else here goes through `docker exec`.
+    """
+    # Checked before the body is read as well as after decoding: refusing a
+    # 2 GB upload should not require holding 2 GB first.
+    declared = request.headers.get("content-length")
+    limit = int(MAX_UPLOAD_MB * 1024 * 1024)
+    if declared and declared.isdigit() and int(declared) > limit * 1.4:
+        return JSONResponse(
+            {"error": f"file is larger than the {MAX_UPLOAD_MB:g} MB limit"},
+            status_code=413)
+
+    try:
+        raw = base64.b64decode(body.data or "", validate=True)
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "attachment was not valid base64"},
+                            status_code=400)
+    if not raw:
+        return JSONResponse({"error": "attachment is empty"}, status_code=400)
+    if len(raw) > limit:
+        return JSONResponse(
+            {"error": f"file is {len(raw)/1048576:.1f} MB, over the "
+                      f"{MAX_UPLOAD_MB:g} MB limit"},
+            status_code=413)
+
+    name = _safe_filename(body.name)
+    convo = _safe_filename(body.convo or "loose")
+    token = secrets.token_hex(4)
+
+    local_dir = UPLOADS_DIR / convo / token
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / name).write_bytes(raw)
+    except OSError as e:
+        return JSONResponse({"error": f"could not store the file: {e}"},
+                            status_code=500)
+
+    agent_dir = f"{AGENT_ATTACH_DIR}/{convo}/{token}"
+    try:
+        # docker cp creates the final component but not the path above it.
+        code, out = await asyncio.wait_for(
+            _run(*_exec_prefix(), "mkdir", "-p", agent_dir), timeout=20)
+        if code != 0:
+            return JSONResponse(
+                {"error": f"could not prepare the agent directory: {out[-200:]}"},
+                status_code=502)
+        code, out = await asyncio.wait_for(
+            _run(*_docker("cp", str(local_dir / name),
+                          f"{HERMES_CONTAINER}:{agent_dir}/{name}")), timeout=60)
+        if code != 0:
+            return JSONResponse(
+                {"error": f"could not copy the file to the agent: {out[-200:]}"},
+                status_code=502)
+    except asyncio.TimeoutError:
+        return JSONResponse({"error": "copying the file to the agent timed out"},
+                            status_code=504)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": f"could not reach the agent: {e}"},
+                            status_code=502)
+
+    return {"name": name, "bytes": len(raw), "path": f"{agent_dir}/{name}"}
 
 
 class StopBody(BaseModel):
