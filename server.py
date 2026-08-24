@@ -639,6 +639,55 @@ async def index(request: Request):
 # is too much for the UI's 15s poll, so the result is cached — the container
 # check is cheap and stays live, and the expensive proof of life refreshes on
 # its own schedule.
+# ── Agent version compatibility ──────────────────────────────────────────
+# Every parser in this file scrapes a CLI that has no --json mode. When
+# upstream reformats its output the failure is not a crash: the sidebar goes
+# quietly empty, or the MCP panel reports nothing wrong. A version the webui
+# has never been checked against is the likeliest cause, and until now nothing
+# said so.
+#
+# Bump this when the fork is next verified against a new agent release. It is
+# a record of what was tested, not a supported-version gate — see
+# _version_verdict for why it never blocks anything.
+VERIFIED_AGENT_VERSION = os.environ.get("HERMES_VERIFIED_VERSION", "0.20.5").strip()
+
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+
+
+def _version_parts(text: str) -> tuple[int, int] | None:
+    """Major and minor from a version string, or None if there isn't one."""
+    m = _VERSION_RE.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _version_verdict(detail: str) -> dict:
+    """Compare the running agent against the version this webui was verified on.
+
+    Patch differences are ignored on purpose. Being a patch ahead is the normal
+    state of a healthy install, and a notice that fires constantly is one people
+    learn to look past — which would cost us the one time it matters.
+
+    An unreadable version is "unknown", never "different". Guessing a mismatch
+    from a string we failed to parse would manufacture exactly the false alarm
+    this is trying to avoid.
+    """
+    running = _version_parts(detail)
+    verified = _version_parts(VERIFIED_AGENT_VERSION)
+    if running is None or verified is None:
+        status = "unknown"
+    elif running == verified:
+        status = "same"
+    else:
+        status = "different"
+    return {
+        "status": status,
+        "running": ".".join(str(p) for p in running) if running else "",
+        "verified": VERIFIED_AGENT_VERSION if verified else "",
+    }
+
+
 AGENT_PROBE_CACHE: dict = {"ts": 0.0, "ready": False, "detail": "", "started_at": ""}
 AGENT_PROBE_TTL = 30.0
 AGENT_PROBE_TIMEOUT = 25.0
@@ -829,6 +878,7 @@ async def health():
         "running": running or inspect_error,
         "agent_ready": agent_ready,
         "agent_detail": agent_detail,
+        "agent_version": _version_verdict(agent_detail if agent_ready else ""),
         "started_at": started_at,
         "restart_count": restarts,
         "last_exit_code": exit_code,

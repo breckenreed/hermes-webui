@@ -1886,6 +1886,36 @@ function newConvo(){
    watchdog. */
 let agentStartedAt = null;
 
+/* ---------- agent version drift ----------
+   Every parser here scrapes a CLI with no --json mode, so an upstream
+   reformat does not crash anything — it empties a panel quietly. A version
+   this webui has never been checked against is the likeliest cause, and it is
+   worth saying once.
+
+   Once, though. This never blocks a turn and never opens a dialog: a warning
+   that fires on every load is one people learn to look past, which would cost
+   us the single time it matters. Patch differences are not mentioned at all —
+   being a patch ahead is the normal state of a healthy install. */
+const VERSION_SEEN_LS = "hermes_version_notice";
+
+function versionNote(v){
+  if(!v) return "";
+  if(v.status === "different") return `agent ${v.running} · verified against ${v.verified}`;
+  if(v.status === "unknown") return "agent version: unreadable";
+  return "";
+}
+
+function noticeVersionDrift(v){
+  if(!v || v.status !== "different") return;
+  const key = `${v.running}->${v.verified}`;
+  let seen = null;
+  try{ seen = localStorage.getItem(VERSION_SEEN_LS); }catch(e){}
+  if(seen === key) return;              // already said, for this exact pair
+  try{ localStorage.setItem(VERSION_SEEN_LS, key); }catch(e){}
+  toast(`Agent is ${v.running}; this webui was verified against ${v.verified}. `
+      + `If a panel looks empty, that is the first thing to suspect.`);
+}
+
 function agentRestarted(startedAt){
   // Any turn older than the agent's current start is dead: the process that
   // was serving it no longer exists. Cut the stream so the normal recovery
@@ -1919,6 +1949,7 @@ async function health(){
     $("#statustext").title = [
       `state: ${j.state}`,
       j.agent_detail ? `agent: ${j.agent_detail}` : "",
+      versionNote(j.agent_version),
       j.started_at ? `started: ${new Date(j.started_at).toLocaleString()}` : "",
       j.restart_count ? `restarts: ${j.restart_count}` : "",
       j.oom_killed ? "last exit: OOM-killed" :
@@ -1930,6 +1961,7 @@ async function health(){
       if(agentStartedAt && j.started_at !== agentStartedAt) agentRestarted(j.started_at);
       agentStartedAt = j.started_at;
     }
+    noticeVersionDrift(j.agent_version);
   }catch(e){
     $("#statustext").textContent="backend offline";
     $("#statusdot").classList.remove("ok","warn");

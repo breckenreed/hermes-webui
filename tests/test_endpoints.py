@@ -546,3 +546,48 @@ class TestPwaAssets:
         nothing private — the same reason the page shell itself is public."""
         assert client.get("/manifest.json").status_code == 200
         assert client.get("/sw.js").status_code == 200
+
+
+class TestAgentVersionVerdict:
+    """A version this webui has never been checked against is the likeliest
+    cause of a parser quietly returning nothing."""
+
+    def test_the_same_minor_is_not_drift(self, monkeypatch):
+        monkeypatch.setattr(server, "VERIFIED_AGENT_VERSION", "0.20.5")
+        assert server._version_verdict("Hermes Agent v0.20.5")["status"] == "same"
+
+    def test_a_patch_difference_is_ignored(self, monkeypatch):
+        """Being a patch ahead is the normal state of a healthy install, and a
+        notice that fires constantly is one people look past."""
+        monkeypatch.setattr(server, "VERIFIED_AGENT_VERSION", "0.20.5")
+        assert server._version_verdict("Hermes Agent v0.20.9")["status"] == "same"
+
+    @pytest.mark.parametrize("running", ["v0.21.0", "v1.0.0", "v0.19.4"])
+    def test_a_minor_or_major_difference_is_drift(self, running, monkeypatch):
+        monkeypatch.setattr(server, "VERIFIED_AGENT_VERSION", "0.20.5")
+        assert server._version_verdict(f"Hermes Agent {running}")["status"] == "different"
+
+    def test_an_unreadable_version_is_unknown_not_drift(self, monkeypatch):
+        """Guessing a mismatch from a string we failed to parse manufactures
+        the false alarm this is meant to avoid."""
+        monkeypatch.setattr(server, "VERIFIED_AGENT_VERSION", "0.20.5")
+        for text in ("some banner with no numbers", "", "hermes"):
+            assert server._version_verdict(text)["status"] == "unknown"
+
+    def test_it_reports_both_sides(self, monkeypatch):
+        monkeypatch.setattr(server, "VERIFIED_AGENT_VERSION", "0.20.5")
+        v = server._version_verdict("Hermes Agent v0.21.0")
+        assert v["running"] == "0.21" and v["verified"] == "0.20.5"
+
+    def test_health_carries_the_verdict(self, client, fake_exec, fake_run):
+        fake_exec(stdout=b"true|2026-08-22T10:00:00Z|0|0|false")
+        fake_run("Hermes Agent v0.20.5 (2026.8.19)")
+        assert client.get("/api/health").json()["agent_version"]["status"] in (
+            "same", "different", "unknown")
+
+    def test_an_unreachable_agent_reports_unknown_rather_than_drift(
+            self, client, fake_exec, fake_run):
+        """A container that is down tells us nothing about its version."""
+        fake_exec(stdout=b"false|||0|false")
+        fake_run("", code=1)
+        assert client.get("/api/health").json()["agent_version"]["status"] == "unknown"

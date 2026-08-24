@@ -128,6 +128,7 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_COMPACT_DIRECTIVE` | *(built-in default)* | What `/compact` asks the model to produce when folding a conversation into notes |
 | `HERMES_COMPACT_TIMEOUT` | `300` | Seconds a compaction may run before it is abandoned and the container-side process killed |
 | `HERMES_COMPACT_MIN_CHARS` | `80` | Below this, a compaction result is rejected rather than written back as history |
+| `HERMES_VERIFIED_VERSION` | `0.20.5` | The agent version this webui was last checked against. A differing **minor** shows a one-time notice; patch differences are ignored |
 | `HERMES_MAX_UPLOAD_MB` | `20` | Largest attachment accepted; anything bigger is refused with a 413 rather than failing mid-turn |
 | `HERMES_AGENT_ATTACH_DIR` | `/tmp/hermes-webui-attachments` | Where attachments are placed **inside the agent container**. Deliberately not the workspace |
 | `UPLOADS_DIR` | `/app/state/uploads` | The durable copy, on the state volume. Falls back to a temp dir if unwritable |
@@ -373,7 +374,7 @@ The FastAPI backend also exposes a small JSON API you can script against:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET`  | `/api/health` | Is the Hermes container reachable? |
+| `GET`  | `/api/health` | Is the Hermes container reachable? Includes `agent_version: {status, running, verified}` — `status` is `same`, `different` or `unknown` |
 | `POST` | `/api/chat` | Send a turn; streams the reply as SSE (`chunk`/`tool`/`model_switch`/`error`/`ping`/`done`). Body: `{"message","session","history":[{"role","text"}],"model","provider"}` — `session` is a unique per-turn key; `history` is the prior conversation; `model`/`provider` (optional) override Hermes' default for this turn only. A `model_switch` event (`{from,to,ts}`) fires if Hermes' own fallback chain swapped models mid-turn |
 | `POST` | `/api/stop` | Stop the in-flight turn. Body: `{"session"}` (the turn key) |
 | `GET`  | `/api/turn/{session}` | Reattach point for a lost turn: `{status: running\|done\|failed, events, text}`. While running, returns completed sub-steps (tool calls/results, interim messages) live; reports `failed` only after checking the record, the live process, and the Hermes session store |
