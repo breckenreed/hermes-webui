@@ -11,44 +11,6 @@ import pytest
 import server
 
 
-class FakeProc:
-    """Stands in for the asyncio subprocess the docker helpers spawn."""
-
-    def __init__(self, stdout=b"", stderr=b"", returncode=0):
-        self._stdout, self._stderr = stdout, stderr
-        self.returncode = returncode
-
-    async def communicate(self):
-        return self._stdout, self._stderr
-
-    async def wait(self):
-        return self.returncode
-
-
-@pytest.fixture
-def fake_exec(monkeypatch):
-    """Replace subprocess spawning; the test supplies the output."""
-    def install(stdout=b"", stderr=b"", returncode=0):
-        async def _spawn(*args, **kwargs):
-            install.calls.append(args)
-            return FakeProc(stdout, stderr, returncode)
-        monkeypatch.setattr(server.asyncio, "create_subprocess_exec", _spawn)
-    install.calls = []
-    return install
-
-
-@pytest.fixture
-def fake_run(monkeypatch):
-    """Replace server._run, which returns (returncode, text)."""
-    def install(text, code=0):
-        async def _run(*args, **kwargs):
-            install.calls.append(args)
-            return code, text
-        monkeypatch.setattr(server, "_run", _run)
-    install.calls = []
-    return install
-
-
 @pytest.fixture(autouse=True)
 def clear_caches(monkeypatch):
     """Endpoint caches are module globals; a stale one silently passes a test

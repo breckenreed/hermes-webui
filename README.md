@@ -496,6 +496,33 @@ exactly that reason.
 
 ## Security notes
 
+- **Transcripts are scrubbed of credential-shaped text — as damage limitation,
+  not as credential security.** Every turn runs with `--yolo`, and the agent
+  container typically carries a set of long-lived API tokens in its
+  environment. That is not hypothetical: asked which port the webui listens on,
+  the agent went looking, ran `cat /proc/<pid>/environ`, and rendered the whole
+  credential set into the transcript — from there into the browser's
+  `localStorage` and into a turn record on disk that outlives
+  `docker compose up -d --build`. No attacker, no crafted prompt; it did that
+  while trying to answer.
+
+  Streamed output, tool call arguments, tool results and reloaded transcripts
+  now pass through a redactor before they are shown or stored. It catches
+  provider-shaped tokens (`ghp_`, `github_pat_`, `sk-`, `xox…`, `tvly-`,
+  `AKIA…`, PEM private-key headers) and, more usefully, any `NAME=value` whose
+  name looks like a credential — which is what catches an `environ` dump
+  wholesale, including token shapes nobody anticipated.
+
+  The variable name is kept (`GITHUB_TOKEN=<redacted>`) on purpose: a log that
+  quietly loses text is its own debugging problem, and you need to be able to
+  tell *"the agent saw nothing"* from *"the log is hiding it"*. Expect
+  occasional false positives — a conversation genuinely about a config file
+  will get redacted — which is the right trade for something that persists.
+
+  **This does not make the credentials safe.** They are still sitting where the
+  agent can read them; redaction only stops them being written down again. The
+  actual fix is not to put them there.
+
 - **Set `WEBUI_TOKEN` on any shared network.** The webui grants full agent
   access (including yolo file writes) to whoever reaches the port. With a token
   set, every `/api/*` request must carry `Authorization: Bearer <token>`; the
