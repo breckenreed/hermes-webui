@@ -138,6 +138,9 @@ Set in `docker-compose.yml` (or via environment):
 | `HERMES_TRIPWIRES` | *(built-in list)* | Newline-separated `name=regex` rules matched against tool calls. Empty string disables the feature. See [Tripwires](#tripwires) |
 | `WEBUI_TOKEN` | *(empty = open)* | Access token required for all `/api/*` calls (`Authorization: Bearer`). Set it on any shared network |
 | `WEBUI_TLS` | `0` | `1` = HTTPS with an auto-generated self-signed cert on the same port |
+| `WEBUI_RATE_LIMIT_CONCURRENT` | `0` (off) | Most turns one identity may have running at once |
+| `WEBUI_RATE_LIMIT_TURNS` | `0` (off) | Most turns one identity may start per window |
+| `WEBUI_RATE_LIMIT_WINDOW` | `3600` | Length of that window, in seconds |
 | `WEBUI_AUTH_MAX_FAILURES` | `10` | Bad tokens from one IP before it is locked out |
 | `WEBUI_AUTH_LOCKOUT_SECONDS` | `60` | How long that lockout lasts |
 | `TURNS_DIR` | `/app/state/turns` | Where turn records are kept. Falls back to a temp dir if unwritable |
@@ -677,6 +680,18 @@ skipped with a startup warning rather than taking the others down with it.
   It does **not** protect the destinations that are on the list — an injected
   "push this to GitHub" still works if GitHub is allowed — so narrow token
   scopes remain the other half.
+
+- **Turn limits are available but off by default.** On a single-user install
+  they should not exist. They earn their place once more than one person shares
+  an inference host: agent mode auto-continues on its own, so a runaway turn
+  does not slow down the person who started it — it takes the model server away
+  from everyone else. `WEBUI_RATE_LIMIT_CONCURRENT` bounds simultaneous turns
+  per identity and `WEBUI_RATE_LIMIT_TURNS` bounds starts per window. Identity
+  is the auth token when one is set, and the client address otherwise — so this
+  starts meaning "per person" the day tokens are issued per person, with no
+  further change. Auto-continue rounds count, because they are the case that
+  motivates the limit. A refused turn says what the limit is and when it frees
+  up, and leaves no record behind: the check runs before anything is spawned.
 
 - **Set `WEBUI_TOKEN` on any shared network.** The webui grants full agent
   access (including yolo file writes) to whoever reaches the port. With a token
