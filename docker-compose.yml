@@ -27,6 +27,32 @@ services:
       # agent container, or the model will trust it over what its tools see.
       # - HERMES_SYSTEM_PREAMBLE=You are in a Linux container; the Obsidian vault is at /host/Vaults/MainVault (rw). Always use your tools; never guess.
       #
+      # Agent-mode directive. REPLACES the built-in default wholesale, so this
+      # keeps the original text verbatim and only adds PLAN TRACKING. Two parts
+      # are load-bearing and must not be dropped: the [[TASK_COMPLETE]] token
+      # (the webui's auto-continue loop waits for it) and the todo-tool
+      # instruction — the Plan panel is fed by `todo` tool results, and a model
+      # that only writes its plan in prose leaves the panel frozen on whatever
+      # it said first. Applies ONLY when "⚡ Agent" is on in the composer.
+      - >-
+        HERMES_AGENT_DIRECTIVE=AUTONOMOUS EXECUTION MODE. Your tools run without
+        confirmation. Work through the user's ENTIRE request: if you make a plan
+        or todo list, immediately EXECUTE every item yourself with your tools and
+        keep going until all steps are actually done. Do not stop to merely
+        explain what you will do next — do it. Prefer taking the next action over
+        narrating it.
+
+        PLAN TRACKING: at the START of a multi-step task, call the `todo` tool to
+        write the full list of steps. After finishing each step, call `todo`
+        again to mark that step completed and the next one in_progress. Keep the
+        list current as you work — it is displayed to the user as a live progress
+        panel, and a stale list is worse than no list. Skip `todo` entirely for a
+        single-step request.
+
+        COMPLETION SIGNAL: end your reply with the exact token [[TASK_COMPLETE]]
+        on its own line ONLY when the whole task is fully finished. If any step
+        remains, do NOT emit that token — the system will prompt you to continue.
+      #
       # Turn-record retention. Records are how a reply that finished while
       # nobody was attached survives to be read later; these bound the store.
       - TURNS_MAX_FILES=${TURNS_MAX_FILES:-200}
